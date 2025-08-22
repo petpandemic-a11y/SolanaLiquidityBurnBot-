@@ -5,7 +5,7 @@
   "description": "Telegram bot for Solana burns (Bitquery, enriched report).",
   "main": "SRC/index.js",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node SRC/index.js"
   },
   "dependencies": {
     "@solana/spl-token": "^0.4.7",
