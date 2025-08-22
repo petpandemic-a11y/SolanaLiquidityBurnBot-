@@ -19,11 +19,11 @@ if (!CHANNEL_ID) throw new Error('Missing CHANNEL_ID');
 const bot = new Telegraf(BOT_TOKEN);
 
 // dedup cache
-const seen = new Map(); // sig -> ts(ms)
+const seen = new Map();
 const dedupMs = Number(DEDUP_MINUTES) * 60 * 1000;
 
 // price cache (Jupiter)
-const priceCache = new Map(); // mint -> {price, ts}
+const priceCache = new Map();
 const PRICE_TTL_MS = 60 * 1000;
 
 function short(s){ return s && s.length>12 ? s.slice(0,4)+'…'+s.slice(-4) : s; }
@@ -123,7 +123,6 @@ async function post(b){
 }
 
 async function pollOnce(){
-  // clean dedup
   const now = Date.now();
   for(const [k,ts] of Array.from(seen.entries())) if (now - ts > dedupMs) seen.delete(k);
 
@@ -158,10 +157,14 @@ async function pollOnce(){
 bot.command('ping', (ctx)=>ctx.reply('pong'));
 
 (async ()=>{
+  // Tisztán induljunk, ne legyen több session
+  await bot.telegram.deleteWebhook({ drop_pending_updates: true });
   await bot.launch({ dropPendingUpdates: true });
+
   try{
     await bot.telegram.sendMessage(CHANNEL_ID, `✅ BurnBot elindult. /ping → pong • Szűrés: ≥$${MIN_USD} burn`);
   }catch(e){ console.error('startup send error:', e?.message); }
+
   await pollOnce();
   setInterval(pollOnce, Number(POLL_INTERVAL_SEC)*1000);
 })();
