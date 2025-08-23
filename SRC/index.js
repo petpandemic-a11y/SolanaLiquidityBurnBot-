@@ -5,44 +5,85 @@ dotenv.config();
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
 const CHANNEL_ID = process.env.CHANNEL_ID;
+const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
+const BIRDEYE_GRAPHQL = "https://public-api.birdeye.so/graphql";
 
-// Új univerzális DexScreener API
-const DEXSCREENER_API = "https://api.dexscreener.com/latest/dex/pairs";
-
-async function fetchBurnEvents() {
-  console.log("🔄 Ellenőrzés indul...");
-
+// GraphQL hívás segédfüggvény
+async function birdeyeQuery(query, variables = {}) {
   try {
-    // Lekérjük az összes elérhető párt
-    const res = await axios.get(DEXSCREENER_API, { timeout: 20000 });
-    const pairs = res.data?.pairs || [];
-
-    // Csak Solana hálózatot nézünk
-    const solanaPairs = pairs.filter(pair => pair.chainId === "solana");
-
-    for (const pair of solanaPairs) {
-      const liquidityUSD = pair.liquidity?.usd || 0;
-
-      // Ha LP = 0 → teljes LP burn
-      if (liquidityUSD === 0) {
-        const msg = `
-🔥 *100% LP Burn Detected!* 🔥
-
-💎 *Token:* ${pair.baseToken.name} (${pair.baseToken.symbol})
-📜 *Contract:* \`${pair.baseToken.address}\`
-💰 *Price:* $${pair.priceUsd || "N/A"}
-📈 *FDV:* $${pair.fdv || "N/A"}
-💧 *Liquidity:* $${liquidityUSD}
-🔗 [View on DexScreener](${pair.url})
-        `;
-
-        await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
+    const res = await axios.post(
+      BIRDEYE_GRAPHQL,
+      { query, variables },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": BIRDEYE_API_KEY,
+        },
+        timeout: 8000,
       }
-    }
-  } catch (e) {
-    console.error("API hiba:", e.message);
+    );
+    return res.data.data;
+  } catch (err) {
+    console.error("Birdeye API hiba:", err.message);
+    return null;
   }
 }
 
-// 10 mp-enként frissít
+// Token list lekérdezés (top 100 token marketcap szerint)
+async function fetchTokenList() {
+  const query = `
+    query {
+      tokens(chain: "solana", sort: MARKETCAP, limit: 100, order: DESC) {
+        address
+        symbol
+        name
+        liquidityUSD
+      }
+    }
+  `;
+  const data = await birdeyeQuery(query);
+  return data?.tokens || [];
+}
+
+// Token részletes adatok lekérdezése
+async function fetchTokenDetails(address) {
+  const query = `
+    query ($address: String!) {
+      token(chain: "solana", address: $address) {
+        priceUSD
+        marketCapUSD
+        holders
+      }
+    }
+  `;
+  const data = await birdeyeQuery(query, { address });
+  return data?.token || {};
+}
+
+// Fő LP-burn figyelő függvény
+async function fetchBurnEvents() {
+  console.log("🔄 Ellenőrzés indul...");
+
+  const tokens = await fetchTokenList();
+  for (const token of tokens) {
+    if (token.liquidityUSD === 0) {
+      const details = await fetchTokenDetails(token.address);
+
+      const msg = `
+🔥 *100% LP Burn Detected!* 🔥
+
+💎 *Token:* ${token.name} (${token.symbol})
+📜 *Contract:* \`${token.address}\`
+💰 *Price:* $${details.priceUSD?.toFixed(6) || "N/A"}
+📈 *Market Cap:* $${details.marketCapUSD?.toLocaleString() || "N/A"}
+👥 *Holders:* ${details.holders || "N/A"}
+🔗 [View on Birdeye](https://birdeye.so/token/${token.address}?chain=solana)
+      `;
+
+      await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
+    }
+  }
+}
+
+// 10 másodpercenként fut a lekérdezés
 setInterval(fetchBurnEvents, 10000);
