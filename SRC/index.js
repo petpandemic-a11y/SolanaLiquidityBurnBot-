@@ -4,105 +4,86 @@ import { Telegraf } from "telegraf";
 
 dotenv.config();
 
-// --- ENV változók ---
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
-
-if (!BOT_TOKEN || !CHANNEL_ID) {
-  console.error("[Bot] ❌ BOT_TOKEN vagy CHANNEL_ID hiányzik a .env fájlból!");
-  process.exit(1);
-}
-
 const bot = new Telegraf(BOT_TOKEN);
 
-// --- API végpontok ---
-const RAYDIUM_API = "https://api.raydium.io/v2/sdk/liquidity/mainnet.json";
-const JUPITER_API = "https://quote-api.jup.ag/v6/tokens";
+const RAYDIUM_API = "https://api-v3.raydium.io/pools";
+const JUPITER_API = "https://price.jup.ag/v6/pools";
 
-// --- Időzítés ---
-const CHECK_INTERVAL = 15000; // 15 másodpercenként ellenőrzés
+// Ellenőrzési intervallum (ms)
+const CHECK_INTERVAL = 20000;
 
-let pools = [];
-let lastBurns = new Set();
-
-// --- LP poolok betöltése Raydiumról ---
-async function loadPools() {
-  try {
-    console.log("[Bot] 🌊 Raydium poolok lekérése...");
-    const res = await axios.get(RAYDIUM_API, { timeout: 15000 });
-
-    if (!res.data) throw new Error("Üres Raydium API válasz");
-
-    pools = Object.values(res.data.official ?? {}).concat(Object.values(res.data.unOfficial ?? {}));
-
-    console.log(`[Bot] ✅ Raydium poolok betöltve: ${pools.length} pool.`);
-  } catch (err) {
-    console.error("[Bot] ❌ Raydium API hiba:", err.message);
-    console.log("[Bot] 🌐 Jupiter fallback indul...");
-    await loadPoolsFromJupiter();
-  }
-}
-
-// --- LP poolok betöltése Jupiter fallbackból ---
-async function loadPoolsFromJupiter() {
-  try {
-    console.log("[Bot] 🌐 Jupiter poolok lekérése...");
-    const res = await axios.get(JUPITER_API, { timeout: 15000 });
-
-    if (!res.data) throw new Error("Üres Jupiter API válasz");
-
-    pools = res.data;
-    console.log(`[Bot] ✅ Jupiter poolok betöltve: ${pools.length} pool.`);
-  } catch (err) {
-    console.error("[Bot] ❌ Jupiter API hiba:", err.message);
-    console.log("[Bot] ⚠️ Nem sikerült frissíteni a pool listát.");
-  }
-}
-
-// --- LP burn események ellenőrzése ---
-async function checkLpBurns() {
-  console.log("[Bot] 🔄 Ellenőrzés indul...");
-
-  try {
-    const burnEvents = pools.filter(pool => {
-      // Teszt logika: szűrjük azokat a poolokat, ahol 0 a likviditás
-      return pool.baseReserve === "0" || pool.quoteReserve === "0";
-    });
-
-    if (burnEvents.length === 0) {
-      console.log("[Bot] ℹ️ Nincs új LP burn esemény.");
-      return;
+// Hibakezelés: Telegramra is megy az üzenet
+async function notify(message) {
+    console.log(`[Bot] ${message}`);
+    try {
+        await bot.telegram.sendMessage(CHANNEL_ID, message);
+    } catch (err) {
+        console.error("[Bot] Telegram küldési hiba:", err.message);
     }
-
-    for (const event of burnEvents) {
-      if (lastBurns.has(event.id)) continue;
-      lastBurns.add(event.id);
-
-      const message = `
-🔥 **Új LP Burn esemény!**
-📌 Pool: ${event.name || "Ismeretlen"}
-💧 Token A: ${event.baseMint || "-"}
-💧 Token B: ${event.quoteMint || "-"}
-`;
-
-      await bot.telegram.sendMessage(CHANNEL_ID, message, { parse_mode: "Markdown" });
-      console.log("[Bot] 📢 Új LP burn esemény küldve:", event.name);
-    }
-  } catch (err) {
-    console.error("[Bot] ❌ Hibás LP burn ellenőrzés:", err.message);
-  }
 }
 
-// --- Bot indítása ---
+// LP poolok lekérése Raydium / Jupiter API-ról
+async function fetchPools() {
+    try {
+        console.log("[Bot] 🌊 Raydium poolok lekérése...");
+        const response = await axios.get(RAYDIUM_API);
+        if (response.data?.data?.length) {
+            console.log(`[Bot] ✅ Raydium API OK: ${response.data.data.length} pool`);
+            return response.data.data;
+        } else {
+            throw new Error("Üres Raydium API válasz");
+        }
+    } catch (err) {
+        console.log("[Bot] ⚠️ Raydium API hiba:", err.message);
+        console.log("[Bot] 🌐 Jupiter fallback indul...");
+
+        try {
+            const jupiterRes = await axios.get(JUPITER_API);
+            console.log(`[Bot] ✅ Jupiter API OK: ${jupiterRes.data.length} pool`);
+            return jupiterRes.data;
+        } catch (jupErr) {
+            console.error("[Bot] ❌ Jupiter API hiba:", jupErr.message);
+            await notify("⚠️ Nem elérhető sem a Raydium, sem a Jupiter API!");
+            return [];
+        }
+    }
+}
+
+// LP burn események figyelése
+async function checkBurnEvents() {
+    try {
+        const pools = await fetchPools();
+
+        if (!pools.length) {
+            console.log("[Bot] ❌ Nincs elérhető pool adat!");
+            return;
+        }
+
+        // Keresés LP burn eseményekre
+        const burns = pools.filter(pool => pool.name?.toLowerCase().includes("burn"));
+        if (burns.length) {
+            for (const burn of burns) {
+                await notify(`🔥 LP burn esemény: ${burn.name} | Pool ID: ${burn.id || burn.address}`);
+            }
+        } else {
+            console.log("[Bot] ℹ️ Nincs új LP burn esemény.");
+        }
+    } catch (err) {
+        console.error("[Bot] Ellenőrzési hiba:", err.message);
+    }
+}
+
+// Indítás
 (async () => {
-  console.log("[Bot] 🚀 LP Burn Bot indul...");
+    console.clear();
+    console.log("🚀 LP Burn Bot indul...");
+    await notify("🚀 LP Burn Bot elindult és figyeli az LP burn eseményeket!");
 
-  await loadPools();
-
-  setInterval(async () => {
-    if (pools.length === 0) {
-      await loadPools();
-    }
-    await checkLpBurns();
-  }, CHECK_INTERVAL);
+    // Ismételt ellenőrzés
+    setInterval(async () => {
+        console.log("[Bot] 🔄 Ellenőrzés indul...");
+        await checkBurnEvents();
+    }, CHECK_INTERVAL);
 })();
