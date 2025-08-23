@@ -1,13 +1,16 @@
-// SRC/index.js — Sol Burn Bot (CommonJS, SOL mode)
-// - Bitquery v2 EAP: TokenSupplyUpdates -> burn-ek
-// - Birdeye ár (SOL/USD + token USD), DexScreener enrich
-// - LP filter strict / relaxed
-// - Szűrők: MIN_SOL (burn SOL-ban), MAX_MCAP_SOL (FDV SOL-ban)
-// - Watchdog, debug parancsok, dedup védelem
+// SRC/index.js — Sol Burn Bot (CommonJS, SOL mode, full version)
+// Features:
+// - Bitquery v2 EAP: TokenSupplyUpdates -> burns
+// - Birdeye prices (SOL/USD + token/USD)
+// - DexScreener enrich (liqUsd, fdv, socials, pair URL)
+// - LP filter: strict (liqUsd == 0 only) / relaxed (n/a allowed)
+// - Filters: MIN_SOL (burn value in SOL), MAX_MCAP_SOL (FDV in SOL)
+// - RPC: supply, top10 holders, authorities
+// - Telegram bot commands: /ping /status /setminsol /setmaxmcap /setlp /debugpoll /setinterval
+// - Watchdog for polling, dedup cache, heartbeat log
 
 "use strict";
 
-/* ===== Imports ===== */
 const dotenv = require("dotenv");
 dotenv.config();
 
@@ -36,7 +39,7 @@ if (!BITQUERY_API_KEY) throw new Error("Missing BITQUERY_API_KEY");
 if (!BIRDEYE_API_KEY) console.warn("[WARN] Missing BIRDEYE_API_KEY (prices may fail)");
 
 /* ===== Admin ===== */
-const ADMIN_IDS = [1721507540]; // ide a te Telegram user ID-d
+const ADMIN_IDS = [1721507540]; // <- te Telegram user ID-d
 function isAdmin(ctx){ return !!(ctx && ctx.from && ADMIN_IDS.includes(ctx.from.id)); }
 
 /* ===== Globals ===== */
@@ -53,8 +56,7 @@ let cfg = {
   dedupMinutes: Number(DEDUP_MINUTES) || 10
 };
 
-let lpStrict = true; // LP mód: strict = csak liqUsd==0, relaxed = n/a is átmegy
-
+let lpStrict = true; // LP filter mode
 let pollTimer = null;
 let lastPollAt = 0;
 const seen = new Map();
@@ -62,7 +64,6 @@ const seen = new Map();
 const PRICE_TTL_MS = 180000;
 const priceCache = new Map();
 const solUsdCache = { price: null, ts: 0 };
-const MAX_PRICE_LOOKUPS_PER_POLL = 2;
 
 setInterval(()=>console.log("[HEARTBEAT]", new Date().toISOString()), 15000);
 
@@ -73,17 +74,17 @@ function fmtNum(x, frac=0){ return (x==null ? "n/a" : Number(x).toLocaleString(u
 function fmtPct(x){ return (x==null ? "n/a" : (Number(x)*100).toFixed(2)+"%"); }
 function nowMs(){ return Date.now(); }
 function keyFor(sig, mint){ return (sig||"no-sig")+"::"+(mint||"no-mint"); }
-function pruneSeen(){
-  const limit = cfg.dedupMinutes*60*1000;
-  const t=nowMs();
-  for (const [k,ts] of seen) if (t-ts>limit) seen.delete(k);
-}
 function minutesAgo(tsMs){
   if (!tsMs) return "n/a";
   const m = Math.floor((Date.now()-tsMs)/60000);
   if (m<1) return "just now";
   if (m===1) return "1 minute ago";
   return m+" minutes ago";
+}
+function pruneSeen(){
+  const limit = cfg.dedupMinutes*60*1000;
+  const t=nowMs();
+  for (const [k,ts] of seen) if (t-ts>limit) seen.delete(k);
 }
 
 /* ===== Backoff fetch ===== */
@@ -122,7 +123,7 @@ async function fetchJSONWithBackoff(url, opts={}, maxRetries=5, baseDelayMs=500)
   throw new Error("unreachable");
 }
 
-/* ===== Bitquery ===== */
+/* ===== Bitquery v2 GQL ===== */
 function GQL(sec){
 return `
 query {
@@ -169,7 +170,7 @@ function parseBurnNodes(nodes){
   return out;
 }
 
-/* ===== Birdeye prices ===== */
+/* ===== Birdeye ===== */
 const SOL_MINT="So11111111111111111111111111111111111111112";
 async function getUsdPriceByMint(mint){
   const now=Date.now();
@@ -335,4 +336,15 @@ bot.command("setminsol",ctx=>{
 });
 bot.command("setmaxmcap",ctx=>{
   if(!isAdmin(ctx)) return ctx.reply("No permission");
-  const v=Number((ctx.message.text.split(" ")[1])||
+  const v=Number((ctx.message.text.split(" ")[1])||0);
+  cfg.maxMcapSol=v; ctx.reply("MAX_MCAP_SOL="+v);
+});
+bot.command("setlp",ctx=>{
+  if(!isAdmin(ctx)) return ctx.reply("No permission");
+  const arg=(ctx.message.text.split(" ")[1]||"").toLowerCase();
+  if(arg==="relaxed"){ lpStrict=false; ctx.reply("LP mode=relaxed"); }
+  else { lpStrict=true; ctx.reply("LP mode=strict"); }
+});
+bot.command("debugpoll",ctx=>{
+  if(!isAdmin(ctx)) return ctx.reply("No permission");
+  pollOnce().then(()=>ctx.reply("
