@@ -1,80 +1,86 @@
-import WebSocket from "ws";
-import fetch from "node-fetch";
-import TelegramBot from "node-telegram-bot-api";
+import 'dotenv/config';
+import WebSocket from 'ws';
+import TelegramBot from 'node-telegram-bot-api';
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
-const channelId = process.env.CHANNEL_ID;
-const heliusApiKey = process.env.HELIUS_API_KEY;
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+const TELEGRAM_TOKEN = process.env.BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.CHANNEL_ID;
 
-// Solana burn címek
+// --- Burn címek listája ---
 const BURN_ADDRESSES = [
   "11111111111111111111111111111111",
-  "Burn111111111111111111111111111111111111111",
-  "So11111111111111111111111111111111111111112"
+  "1nc1nerator11111111111111111111111111111",
+  "BurnXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX11111"
 ];
 
-// WebSocket kapcsolat a Helius RPC-vel
-const wsUrl = `wss://mainnet.helius-rpc.com/?api-key=${heliusApiKey}`;
-const ws = new WebSocket(wsUrl);
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
 
-ws.on("open", () => {
-  console.log("🌐 Kapcsolódva a Helius WebSockethez!");
+// --- Helius WebSocket kapcsolat ---
+const ws = new WebSocket(`wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`);
 
-  // LP token transfer figyelés
-  const message = {
+ws.on('open', () => {
+  console.log('🌍 Kapcsolódva a Helius WebSockethez!');
+  const subscribeMessage = {
     jsonrpc: "2.0",
-    id: "1",
+    id: 1,
     method: "transactionSubscribe",
     params: [
       {
-        accountInclude: [], // minden LP pool
-        includeEvents: true,
-        commitment: "confirmed"
+        accountInclude: [],
+        encoding: "jsonParsed"
       }
     ]
   };
-
-  ws.send(JSON.stringify(message));
+  ws.send(JSON.stringify(subscribeMessage));
 });
 
-ws.on("message", async (data) => {
+ws.on('message', async (data) => {
   try {
-    const parsed = JSON.parse(data);
-    const tx = parsed?.params?.result?.transaction;
+    const msg = JSON.parse(data);
 
-    if (!tx || !tx.meta) return;
+    // Csak akkor érdekel, ha van tranzakciós adat
+    if (!msg?.params?.result?.transaction) return;
 
-    const instructions = tx.transaction.message.instructions || [];
-    for (const ix of instructions) {
-      // SPL Token Transfer ellenőrzése
-      if (ix.programId && ix.programId === "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA") {
-        const destination = ix.parsed?.info?.destination;
-        const amount = ix.parsed?.info?.amount;
+    const tx = msg.params.result.transaction;
+    const meta = msg.params.result.meta;
 
-        if (destination && BURN_ADDRESSES.includes(destination)) {
-          // Telegram értesítés
-          await bot.sendMessage(
-            channelId,
-            `🔥 **LP BURN ÉSZLELVE** 🔥\n\n` +
-            `🔹 TX: https://solscan.io/tx/${parsed.params.result.signature}\n` +
-            `💧 Elégetett mennyiség: ${amount}\n` +
-            `📍 Cím: \`${destination}\``
-          );
+    if (!meta || !meta.postTokenBalances || meta.postTokenBalances.length === 0) return;
 
-          console.log(`🔥 LP burn: ${amount} token -> ${destination}`);
+    // Végigmegyünk az összes tokenen, és megnézzük, mi történt az LP-vel
+    for (let balance of meta.postTokenBalances) {
+      const pre = meta.preTokenBalances?.find(b => b.mint === balance.mint);
+      const preAmount = pre ? Number(pre.uiTokenAmount.amount) : 0;
+      const postAmount = Number(balance.uiTokenAmount.amount);
+
+      // Ha az LP teljes mennyisége eltűnt, akkor tovább vizsgáljuk
+      if (preAmount > 0 && postAmount === 0) {
+        // Megnézzük, hogy a tranzakció egyik kimenete burn címre ment-e
+        const burnOutput = tx.message.accountKeys.find(acc => BURN_ADDRESSES.includes(acc.pubkey));
+        if (burnOutput) {
+          const msgText = `
+🔥 **ÚJ LP BURN ESEMÉNY** 🔥
+
+🌐 Pool mint: ${balance.mint}
+💧 Elégetett mennyiség: ${pre.uiTokenAmount.uiAmountString}
+🪦 Burn cím: ${burnOutput}
+
+🔗 https://solscan.io/tx/${msg.params.result.signature}
+          `;
+          await bot.sendMessage(TELEGRAM_CHAT_ID, msgText, { parse_mode: 'Markdown' });
+          console.log("🚀 Jelentés elküldve Telegramra!");
         }
       }
     }
-  } catch (err) {
-    console.error("❌ Hiba a WebSocket üzenet feldolgozásakor:", err);
+  } catch (error) {
+    console.error("Hiba a feldolgozás közben:", error);
   }
 });
 
-ws.on("close", () => {
-  console.log("⚠️ Helius WebSocket kapcsolat bontva. Újracsatlakozás 5s...");
-  setTimeout(() => ws.connect(), 5000);
+ws.on('error', (err) => {
+  console.error("❌ Helius WebSocket hiba:", err);
 });
 
-ws.on("error", (err) => {
-  console.error("❌ WebSocket hiba:", err);
+ws.on('close', () => {
+  console.log("⚠️ Kapcsolat bontva a Helius-szal, újracsatlakozás...");
+  setTimeout(() => process.exit(1), 3000);
 });
