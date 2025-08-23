@@ -1,15 +1,14 @@
 {
   "name": "solana-lp-burn-bot",
   "version": "1.0.0",
-  "description": "Telegram bot Solana LP burn eseményekhez (Bitquery v2 API)",
-  "main": "SRC/index.js",
   "type": "module",
+  "main": "SRC/index.js",
   "scripts": {
     "start": "node SRC/index.js"
   },
   "dependencies": {
-    "axios": "^1.7.3",
-    "telegraf": "^4.12.3",
+    "axios": "^1.6.7",
+    "telegraf": "^4.12.2",
     "dotenv": "^16.4.5"
   }
 }
