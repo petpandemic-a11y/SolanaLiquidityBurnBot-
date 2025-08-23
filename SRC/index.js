@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-// ====== ENV ======
+// ====== ENV változók ======
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
@@ -16,40 +16,40 @@ const BURN_ADDRESSES = [
   "11111111111111111111111111111111",
   "1nc1nerator11111111111111111111111111111"
 ];
-const LP_BURN_THRESHOLD = 95; // %
+const LP_BURN_THRESHOLD = 95; // százalékban
 
-// ====== LP burn események lekérdezése ======
+// ====== Bitquery GraphQL lekérdezés LP burn eseményekre ======
 async function fetchLPBurns() {
   const query = `
-  query LPBurns {
-    solana(network: solana) {
-      transfers(
-        options: {desc: "block.timestamp.time", limit: 10}
-        date: {since: "2025-08-23T00:00:00"}
-        receiver: {in: ${JSON.stringify(BURN_ADDRESSES)}}
-      ) {
-        block {
-          timestamp {
-            time(format: "%Y-%m-%d %H:%M:%S")
+    query LPBurns {
+      solana(network: solana) {
+        transfers(
+          options: {desc: "block.timestamp.time", limit: 10}
+          date: {since: "2025-08-23T00:00:00"}
+          receiverAddress: {in: ${JSON.stringify(BURN_ADDRESSES)}}
+        ) {
+          block {
+            timestamp {
+              time(format: "%Y-%m-%d %H:%M:%S")
+            }
           }
-        }
-        amount
-        currency {
-          symbol
-          address
-        }
-        sender {
-          address
-        }
-        receiver {
-          address
-        }
-        transaction {
-          signature
+          amount
+          currency {
+            symbol
+            address
+          }
+          sender {
+            address
+          }
+          receiver {
+            address
+          }
+          transaction {
+            signature
+          }
         }
       }
     }
-  }
   `;
 
   try {
@@ -110,7 +110,7 @@ async function fetchTotalSupply(tokenAddress) {
   }
 }
 
-// ====== Események feldolgozása ======
+// ====== LP burn események feldolgozása ======
 async function checkLPBurns() {
   console.log("🔄 Ellenőrzés indul...");
   const burns = await fetchLPBurns();
@@ -141,6 +141,6 @@ Tx: https://solscan.io/tx/${burn.transaction.signature}
   }
 }
 
-// ====== Indítás ======
+// ====== Bot indítása ======
 console.log("🚀 LP Burn Bot elindult! Csak Bitquery API-t használ.");
 setInterval(checkLPBurns, 10000);
