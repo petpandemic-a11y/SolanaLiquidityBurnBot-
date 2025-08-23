@@ -509,5 +509,3 @@ bot.command("setmaxmcap", function(ctx){
       ].join("\n")
     );
   }catch(e){ console.error("[startup send error]", e && e.message ? e.message : e); }
-
-  aw
