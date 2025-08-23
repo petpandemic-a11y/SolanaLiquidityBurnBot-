@@ -7,13 +7,16 @@ const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
 
-// Birdeye API token info lekérése
+// Birdeye token infó lekérése
 async function fetchTokenInfo(tokenAddress) {
   try {
     const res = await axios.get(
-      `https://public-api.birdeye.so/public/token?address=${tokenAddress}`,
+      `https://api.birdeye.so/public/v1/token?address=${tokenAddress}&chain=solana`,
       {
-        headers: { "X-API-KEY": BIRDEYE_API_KEY },
+        headers: {
+          "X-API-KEY": BIRDEYE_API_KEY,
+          "accept": "application/json",
+        },
       }
     );
     return res.data?.data || null;
@@ -23,23 +26,25 @@ async function fetchTokenInfo(tokenAddress) {
   }
 }
 
-// Birdeye API legfrissebb Solana tokenek
+// LP burn figyelése
 async function fetchBurnEvents() {
   try {
     const res = await axios.get(
-      "https://public-api.birdeye.so/public/tokenlist?sort=marketcap&sort_type=desc&offset=0&limit=50&chain=solana",
+      "https://api.birdeye.so/public/v1/tokenlist?sort=marketcap&sort_type=desc&offset=0&limit=50&chain=solana",
       {
-        headers: { "X-API-KEY": BIRDEYE_API_KEY },
+        headers: {
+          "X-API-KEY": BIRDEYE_API_KEY,
+          "accept": "application/json",
+        },
       }
     );
 
     const tokens = res.data?.data?.tokens || [];
 
     for (const token of tokens) {
-      // LP likviditás USD érték
       const liquidityUSD = token.liquidity || 0;
 
-      // Ha az LP likviditás = 0 → teljes LP burn
+      // Ha LP = 0 → teljes LP burn
       if (liquidityUSD === 0) {
         const tokenInfo = await fetchTokenInfo(token.address);
 
@@ -62,5 +67,5 @@ async function fetchBurnEvents() {
   }
 }
 
-// 10 másodpercenként ellenőrzés
+// 10 mp-enként ellenőrzés
 setInterval(fetchBurnEvents, 10000);
