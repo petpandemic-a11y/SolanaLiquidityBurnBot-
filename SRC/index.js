@@ -1,115 +1,105 @@
 import fetch from "node-fetch";
 import { Telegraf } from "telegraf";
+import dotenv from "dotenv";
+dotenv.config();
 
+// --- ENV változók betöltése ---
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
 
 if (!BOT_TOKEN || !CHANNEL_ID || !BITQUERY_API_KEY) {
-  console.error("❌ Hiba: BOT_TOKEN, CHANNEL_ID vagy BITQUERY_API_KEY nincs beállítva!");
+  console.error("❌ Hiányzik valamelyik ENV változó!");
   process.exit(1);
 }
 
+// --- Telegram Bot inicializálás ---
 const bot = new Telegraf(BOT_TOKEN);
 
-console.log("🚀 LP Burn Bot indul...");
+// --- Bitquery API V2 végpont ---
+const BITQUERY_URL = "https://streaming.bitquery.io/graphql";
 
-/**
- * Bitquery API lekérdezés
- */
-async function fetchBitqueryData() {
-  try {
-    console.log("🔄 Bitquery lekérdezés indul...");
-
-    const query = `
-      query {
-        Solana {
-          Transfers(
-            transferType: burn
-            options: {desc: "block.timestamp.iso8601", limit: 5}
-          ) {
-            Block {
-              Timestamp {
-                iso8601
-              }
-            }
-            Amount
-            Currency {
-              Symbol
-              Address
-            }
-          }
+// --- GraphQL lekérdezés ---
+const query = `
+  query MyQuery {
+    solana {
+      burns(
+        limit: { count: 5 }
+        order_by: { burn_time: desc }
+      ) {
+        amount
+        mint
+        owner
+        transaction {
+          signature
         }
+        burn_time
       }
-    `;
+    }
+  }
+`;
 
-    const response = await fetch("https://graphql.bitquery.io", {
+// --- Bitquery lekérés ---
+async function fetchBitquery() {
+  try {
+    console.log("🔍 Ellenőrzés indul…");
+
+    const response = await fetch(BITQUERY_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-API-KEY": BITQUERY_API_KEY
+        "Authorization": `Bearer ${BITQUERY_API_KEY}`,
       },
       body: JSON.stringify({ query }),
     });
 
-    console.log(`🌍 Bitquery státusz: ${response.status}`);
-
-    const data = await response.json();
-    console.log("📦 Bitquery teljes válasz:", JSON.stringify(data, null, 2));
-
-    if (data.errors) {
-      console.error("❌ Bitquery API hibák:", data.errors);
+    if (!response.ok) {
+      console.error(`❌ Bitquery API hiba: HTTP ${response.status}`);
       return null;
     }
 
-    return data.data?.Solana?.Transfers || [];
+    const data = await response.json();
+
+    if (data.errors) {
+      console.error("❌ Bitquery GraphQL hiba:", data.errors);
+      return null;
+    }
+
+    return data.data.solana.burns || [];
   } catch (error) {
-    console.error("🔥 Bitquery fetch hiba:", error);
+    console.error("🔥 Bitquery fetch hiba:", error.message);
     return null;
   }
 }
 
-/**
- * LP burn események figyelése
- */
-async function checkBurnEvents() {
-  console.log("🔍 Ellenőrzés indul...");
-  const burns = await fetchBitqueryData();
-
+// --- Burn események ellenőrzése ---
+async function checkBurns() {
+  const burns = await fetchBitquery();
   if (!burns || burns.length === 0) {
     console.log("ℹ️ Nincs új LP burn esemény.");
     return;
   }
 
   for (const burn of burns) {
-    const symbol = burn.Currency?.Symbol || "ISMERETLEN";
-    const amount = burn.Amount || 0;
-    const address = burn.Currency?.Address || "N/A";
-    const timestamp = burn.Block?.Timestamp?.iso8601 || "N/A";
+    const msg = `
+🔥 ÚJ LP BURN ÉSZLELVE! 🔥
 
-    const message = `
-🔥 ÚJ LP BURN ESEMÉNY!
-💰 Token: ${symbol}
-📦 Mennyiség: ${amount}
-📜 Cím: ${address}
-⏰ Időpont: ${timestamp}
+💰 Mennyiség: ${burn.amount}
+🪙 Token: ${burn.mint}
+👤 Tulaj: ${burn.owner}
+🔗 Tranzakció: https://solscan.io/tx/${burn.transaction.signature}
+⏰ Időpont: ${burn.burn_time}
     `;
 
-    console.log("📢 Telegram üzenet:", message);
-
-    try {
-      await bot.telegram.sendMessage(CHANNEL_ID, message);
-    } catch (error) {
-      console.error("⚠️ Hiba a Telegram üzenet küldésekor:", error);
-    }
+    await bot.telegram.sendMessage(CHANNEL_ID, msg.trim(), { parse_mode: "Markdown" });
+    console.log("✅ Üzenet elküldve a Telegramra!");
   }
 }
 
-/**
- * Indulás és időzített figyelés
- */
-(async () => {
-  await bot.telegram.sendMessage(CHANNEL_ID, "🚀 LP Burn Bot elindult és figyeli az LP burn eseményeket!");
-  await checkBurnEvents();
-  setInterval(checkBurnEvents, 60000);
-})();
+// --- Időzített ellenőrzés ---
+setInterval(checkBurns, 60_000); // minden 1 percben ellenőrizzük
+
+// --- Bot indítása ---
+bot.launch().then(() => {
+  console.log("🚀 LP Burn Bot elindult és figyeli az eseményeket!");
+});
