@@ -274,7 +274,7 @@ async function rpcStats(mintStr){
     top10 = arr.slice(0,10).map(v => ({ address: v.address.toBase58(), amount: v.uiAmount }));
     if (supplyUi && supplyUi > 0){
       const sum = top10.reduce((a,c)=>a+(Number(c.amount)||0),0);
-      top10Pct = sum / s;
+      top10Pct = sum / supplyUi;   // FIX: divide by supplyUi (not 's')
     }
   }catch(e){}
   try{
@@ -387,7 +387,7 @@ async function postReport(burn){
 
   const text = lines.join('\n');
   try{
-    await bot.telegram.sendMessage(CHANNEL_ID, text, { parse_mode:'Markdown', disable_web_page_preview:true });
+    await bot.telegram.sendMessage(CHANNEL_ID, text, { disable_web_page_preview:true });
     console.log(`[POSTED] sig=${short(burn.sig)} burnSol=${burnSol!=null?burnSol.toFixed(4):'n/a'} SOL`);
     return true;
   }catch(e){
