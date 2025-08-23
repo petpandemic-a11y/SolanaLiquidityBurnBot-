@@ -1,193 +1,144 @@
 import fetch from "node-fetch";
+import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
-import { Telegraf } from "telegraf";
-
 dotenv.config();
 
-// ====== ENV ======
-const BOT_TOKEN = process.env.BOT_TOKEN;
+const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
-const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
 
-let MIN_SOL = parseFloat(process.env.MIN_SOL || "0");
-let MAX_MCAP_SOL = parseFloat(process.env.MAX_MCAP_SOL || "0");
-let POLL_INTERVAL_SEC = parseInt(process.env.POLL_INTERVAL_SEC || "10");
-let POLL_LOOKBACK_SEC = parseInt(process.env.POLL_LOOKBACK_SEC || "12");
-let DEDUP_MINUTES = parseInt(process.env.DEDUP_MINUTES || "10");
-
-let LP_MODE = "relaxed"; // alapértelmezett: relaxed
-
-const bot = new Telegraf(BOT_TOKEN);
-
-// Dedup cache
-const seenTx = new Map();
-
-// ========== GET PRICE (BIRDEYE) ==========
-async function getTokenPrice(mint) {
-  try {
-    const url = `https://public-api.birdeye.so/defi/price?address=${mint}`;
-    const res = await fetch(url, {
-      headers: {
-        "accept": "application/json",
-        "X-API-KEY": BIRDEYE_API_KEY
-      }
-    });
-    const data = await res.json();
-    return data?.data?.value || null;
-  } catch (e) {
-    console.error(`[birdeye price] fail for ${mint}`, e.message);
-    return null;
-  }
+// Bitquery GraphQL lekérdezés küldése
+async function bitqueryRequest(query) {
+  const res = await fetch("https://graphql.bitquery.io", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-KEY": BITQUERY_API_KEY,
+    },
+    body: JSON.stringify({ query }),
+  });
+  return res.json();
 }
 
-async function getSolPrice() {
-  return await getTokenPrice("So11111111111111111111111111111111111111112");
-}
-
-// ========== BITQUERY GRAPHQL ==========
-async function fetchBurns() {
+// Lekérdezzük az LP burn eseményeket
+async function fetchBurnEvents() {
   const query = `
   query {
-    Solana {
-      TokenSupplyUpdates(
+    solana {
+      transfers(
+        options: {desc: "block.timestamp.time", limit: 10}
         where: {
-          Instruction: { Program: { Method: { is: "burn" }}},
-          Block: { Time: { since: "${new Date(Date.now() - POLL_LOOKBACK_SEC * 1000).toISOString()}" }}
+          transfer_type: {is: burn}
+          currency: {tokenType: {is: SPL}}
         }
-        limit: { count: 500 }
       ) {
-        Transaction {
-          Signature
+        block {
+          timestamp {
+            time(format: "%Y-%m-%d %H:%M:%S")
+          }
         }
-        Currency {
-          Mint
+        currency {
+          symbol
+          name
+          address
+          decimals
         }
-        Amount
+        amount
+        transaction {
+          signature
+        }
       }
     }
   }`;
 
-  const res = await fetch("https://streaming.bitquery.io/eap", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": BITQUERY_API_KEY
-    },
-    body: JSON.stringify({ query })
-  });
-
-  const json = await res.json();
-  return json?.data?.Solana?.TokenSupplyUpdates || [];
-}
-
-// ========== FORMAT NUMBER ==========
-function formatSol(sol) {
-  return parseFloat(sol).toFixed(4);
-}
-
-// ========== TELEGRAM POST ==========
-async function postBurn(burn) {
-  const { sig, mint, burnSol, priceUsd, mcapUsd, liqUsd } = burn;
-
-  const solPrice = await getSolPrice();
-  const burnInSol = burnSol;
-  const priceInSol = priceUsd && solPrice ? priceUsd / solPrice : null;
-  const mcapInSol = mcapUsd && solPrice ? mcapUsd / solPrice : null;
-
-  let txt = `🔥 **Token Burn Detected**\n\n`;
-  txt += `**Token:** \`${mint}\`\n`;
-  txt += `**Burned:** ${formatSol(burnInSol)} SOL\n`;
-  txt += `**Price:** ${priceInSol ? formatSol(priceInSol) + " SOL" : "n/a"}\n`;
-  txt += `**Marketcap:** ${mcapInSol ? formatSol(mcapInSol) + " SOL" : "n/a"}\n`;
-  txt += `**Liquidity:** ${liqUsd === 0 ? "💧 0 (LP burned)" : "n/a"}\n\n`;
-  txt += `[🔎 Solscan](https://solscan.io/tx/${sig}) | [📊 Birdeye](https://birdeye.so/token/${mint})`;
-
-  await bot.telegram.sendMessage(CHANNEL_ID, txt, { parse_mode: "Markdown", disable_web_page_preview: true });
-}
-
-// ========== POLLING LOOP ==========
-async function poll() {
   try {
-    const burns = await fetchBurns();
+    const data = await bitqueryRequest(query);
+    const transfers = data.data?.solana?.transfers || [];
 
-    for (const b of burns) {
-      const sig = b.Transaction.Signature;
-      const mint = b.Currency.Mint;
-      const amount = Math.abs(parseFloat(b.Amount));
+    for (const tx of transfers) {
+      const tokenAddress = tx.currency.address;
+      const amountBurned = Number(tx.amount);
 
-      // Dedup
-      if (seenTx.has(sig)) continue;
-      seenTx.set(sig, Date.now());
-      setTimeout(() => seenTx.delete(sig), DEDUP_MINUTES * 60 * 1000);
+      // Lekérjük az LP teljes mennyiségét
+      const totalSupply = await fetchTotalSupply(tokenAddress);
+      if (!totalSupply || amountBurned < totalSupply) continue; // Csak 100%-os burn posztolódjon
 
-      const solPrice = await getSolPrice();
-      const burnSol = solPrice ? amount * solPrice : amount;
+      // Lekérjük token infókat (mcap, price, holders)
+      const tokenInfo = await fetchTokenInfo(tokenAddress);
 
-      if (burnSol < MIN_SOL) {
-        console.log(`[SKIP < MIN_SOL] sig=${sig} burnSol=${burnSol}`);
-        continue;
-      }
+      const msg = `
+🔥 *100% LP Burn Detected!* 🔥
 
-      // Ha van mcap limit
-      if (MAX_MCAP_SOL > 0 && b.mcapUsd && solPrice) {
-        const mcapInSol = b.mcapUsd / solPrice;
-        if (mcapInSol > MAX_MCAP_SOL) {
-          console.log(`[SKIP > MAX_MCAP] sig=${sig} mcapSol=${mcapInSol}`);
-          continue;
-        }
-      }
+💎 *Token:* ${tx.currency.name} (${tx.currency.symbol})
+📜 *Contract:* \`${tokenAddress}\`
+💰 *Price:* $${tokenInfo.price ? tokenInfo.price.toFixed(6) : "N/A"}
+📈 *Market Cap:* $${tokenInfo.mcap ? tokenInfo.mcap.toLocaleString() : "N/A"}
+👥 *Holders:* ${tokenInfo.holders || "N/A"}
+🔥 *Amount Burned:* ${amountBurned.toLocaleString()}
+⏱ *Time:* ${tx.block.timestamp.time}
+🔗 [View Transaction](https://solscan.io/tx/${tx.transaction.signature})
+      `;
 
-      // LP filter
-      if (LP_MODE === "strict" && b.liqUsd && b.liqUsd > 0) {
-        console.log(`[SKIP LP not fully burned] sig=${sig}`);
-        continue;
-      }
-
-      await postBurn({ sig, mint, burnSol: amount, priceUsd: b.priceUsd, mcapUsd: b.mcapUsd, liqUsd: b.liqUsd });
+      await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
     }
-
-    console.log(`[POLL] parsed ${burns.length}`);
   } catch (e) {
-    console.error("[poll error]", e.message);
+    console.error("Hiba az események lekérésekor:", e.message);
   }
 }
 
-// ========== HEARTBEAT ==========
-setInterval(() => {
-  console.log(`[HEARTBEAT] ${new Date().toISOString()}`);
-}, 15000);
+// Teljes kínálat (LP mennyiség) lekérdezése
+async function fetchTotalSupply(tokenAddress) {
+  const query = `
+  query {
+    solana {
+      tokenSupply(
+        where: { mintAddress: {is: "${tokenAddress}"} }
+      ) {
+        supply
+      }
+    }
+  }`;
 
-// ========== LOOP ==========
-setInterval(poll, POLL_INTERVAL_SEC * 1000);
+  try {
+    const data = await bitqueryRequest(query);
+    return Number(data.data?.solana?.tokenSupply?.[0]?.supply || 0);
+  } catch (e) {
+    console.error("TotalSupply hiba:", e.message);
+    return null;
+  }
+}
 
-// ========== BOT COMMANDS ==========
-bot.command("ping", ctx => ctx.reply("pong"));
-bot.command("status", ctx => {
-  ctx.reply(`⚙️ **Config:**\nMIN_SOL=${MIN_SOL} SOL\nMAX_MCAP_SOL=${MAX_MCAP_SOL} SOL\nLP_MODE=${LP_MODE}\nInterval=${POLL_INTERVAL_SEC}s`, { parse_mode: "Markdown" });
-});
-bot.command("setminsol", ctx => {
-  const val = parseFloat(ctx.message.text.split(" ")[1]);
-  if (!isNaN(val)) {
-    MIN_SOL = val;
-    ctx.reply(`✅ MIN_SOL updated to ${MIN_SOL}`);
-  }
-});
-bot.command("setmaxmcap", ctx => {
-  const val = parseFloat(ctx.message.text.split(" ")[1]);
-  if (!isNaN(val)) {
-    MAX_MCAP_SOL = val;
-    ctx.reply(`✅ MAX_MCAP_SOL updated to ${MAX_MCAP_SOL}`);
-  }
-});
-bot.command("setlp", ctx => {
-  const mode = ctx.message.text.split(" ")[1];
-  if (["strict", "relaxed"].includes(mode)) {
-    LP_MODE = mode;
-    ctx.reply(`✅ LP_MODE set to ${LP_MODE}`);
-  }
-});
+// Token infók lekérdezése: mcap, price, holders
+async function fetchTokenInfo(tokenAddress) {
+  const query = `
+  query {
+    solana {
+      tokenHolders(
+        where: { mintAddress: {is: "${tokenAddress}"} }
+      ) {
+        tokenPriceUSD
+        marketCapInUSD
+      }
+      tokenHoldersAggregate(
+        where: { mintAddress: {is: "${tokenAddress}"} }
+      ) {
+        count
+      }
+    }
+  }`;
 
-// ========== START ==========
-bot.launch();
-console.log("🚀 Bot started...");
+  try {
+    const data = await bitqueryRequest(query);
+    return {
+      price: data.data?.solana?.tokenHolders?.[0]?.tokenPriceUSD || null,
+      mcap: data.data?.solana?.tokenHolders?.[0]?.marketCapInUSD || null,
+      holders: data.data?.solana?.tokenHoldersAggregate?.count || null,
+    };
+  } catch (e) {
+    console.error("TokenInfo hiba:", e.message);
+    return {};
+  }
+}
+
+// 10 másodpercenként figyelünk
+setInterval(fetchBurnEvents, 10000);
