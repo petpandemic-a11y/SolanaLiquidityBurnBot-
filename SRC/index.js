@@ -1,10 +1,11 @@
 import dotenv from "dotenv";
 import TelegramBot from "node-telegram-bot-api";
 import WebSocket from "ws";
+import fetch from "node-fetch";
 
 dotenv.config();
 
-// ---- Környezeti változók ----
+// ---- Environment változók ----
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
@@ -14,25 +15,39 @@ if (!BOT_TOKEN || !CHANNEL_ID || !HELIUS_API_KEY) {
   process.exit(1);
 }
 
-// ---- Telegram bot inicializálás ----
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
-// ---- Burn címek a Solana hálózaton ----
+// ---- Solana burn címek ----
 const BURN_ADDRESSES = [
-  "11111111111111111111111111111111", // Null address
-  "BurnXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" // Gyakori burn wallet
+  "11111111111111111111111111111111",
+  "1nc1nerator11111111111111111111111111111",
+  "BurnXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX11111"
 ];
 
 // ---- Helius WebSocket URL ----
 const HELIUS_WS = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-
-// ---- WebSocket inicializálás ----
 const ws = new WebSocket(HELIUS_WS);
 
-ws.on("open", () => {
-  console.log("🔗 Kapcsolódva a Helius WebSockethez!");
+// LP tokenek mint-jeinek lekérése Raydiumtól
+let lpTokens = [];
 
-  // Feliratkozás a tranzakciós streamre
+async function fetchLPTokens() {
+  try {
+    const res = await fetch("https://api.raydium.io/v2/sdk/liquidity/mainnet.json");
+    const pools = await res.json();
+
+    lpTokens = Object.values(pools).map((pool) => pool.lpMint);
+    console.log(`✅ ${lpTokens.length} LP token mint beállítva Raydiumról`);
+  } catch (err) {
+    console.error("❌ LP token lista letöltési hiba:", err);
+  }
+}
+
+// Feliratkozás WebSocketre
+ws.on("open", async () => {
+  console.log("🔗 Kapcsolódva a Helius WebSockethez!");
+  await fetchLPTokens();
+
   ws.send(
     JSON.stringify({
       jsonrpc: "2.0",
@@ -43,46 +58,60 @@ ws.on("open", () => {
   );
 });
 
+// Tranzakciók figyelése
 ws.on("message", async (msg) => {
   try {
     const data = JSON.parse(msg);
+    const tx = data?.params?.result;
+    if (!tx) return;
 
-    if (data?.params?.result) {
-      const tx = data.params.result;
+    const instructions = tx.transaction.message.instructions || [];
+    for (const ix of instructions) {
+      if (ix.program !== "spl-token") continue;
 
-      // Token átutalások keresése
-      const tokenTransfers = tx.transaction?.message?.instructions
-        ?.filter((ix) => ix.program === "spl-token")
-        ?.map((ix) => ({
-          source: ix.parsed?.info?.source,
-          destination: ix.parsed?.info?.destination,
-          amount: Number(ix.parsed?.info?.amount)
-        }))
-        ?.filter(Boolean);
+      const info = ix.parsed?.info;
+      if (!info) continue;
 
-      if (!tokenTransfers?.length) return;
+      const { destination, amount, mint } = info;
 
-      // Burn tranzakciók szűrése
-      for (const transfer of tokenTransfers) {
-        if (
-          BURN_ADDRESSES.includes(transfer.destination) &&
-          transfer.amount > 0
-        ) {
-          // Értesítés Telegramra
+      // Csak LP tokenek figyelése
+      if (!lpTokens.includes(mint)) continue;
+
+      // Csak burn címekre menő utalások
+      if (BURN_ADDRESSES.includes(destination)) {
+        // Lekérdezzük a jelenlegi LP token supply-t
+        const supplyRes = await fetch(`https://api.mainnet-beta.solana.com`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getTokenSupply",
+            params: [mint]
+          })
+        });
+
+        const supplyData = await supplyRes.json();
+        const remainingSupply = Number(supplyData.result.value.amount);
+
+        // Csak akkor küldünk értesítést, ha teljes burn történt
+        if (remainingSupply === 0) {
           const message = `
-🔥 **LP Burn esemény!**
-💧 Token: LP
-📤 Elküldött mennyiség: ${transfer.amount}
-📜 Tranzakció: https://solscan.io/tx/${tx.signature}
+🔥 **100% LP BURN ESEMÉNY** 🔥
+
+🌐 LP Mint: \`${mint}\`
+💧 Elégetett mennyiség: ${amount}
+🪦 Burn cím: \`${destination}\`
+🔗 [Tranzakció](https://solscan.io/tx/${tx.signature})
           `;
 
           await bot.sendMessage(CHANNEL_ID, message, { parse_mode: "Markdown" });
-          console.log("✅ LP Burn értesítés elküldve!");
+          console.log("✅ LP burn értesítés elküldve!");
         }
       }
     }
   } catch (err) {
-    console.error("❌ Hiba a WebSocket üzenet feldolgozása közben:", err);
+    console.error("❌ Hiba a tranzakció feldolgozásakor:", err);
   }
 });
 
@@ -91,6 +120,6 @@ ws.on("error", (err) => {
 });
 
 ws.on("close", () => {
-  console.log("⚠️ WebSocket kapcsolat lezárva. Újracsatlakozás 5 mp múlva...");
+  console.log("⚠️ WebSocket kapcsolat bontva. Újracsatlakozás 5 mp múlva...");
   setTimeout(() => ws.connect(HELIUS_WS), 5000);
 });
