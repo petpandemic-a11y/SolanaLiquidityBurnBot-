@@ -1,7 +1,7 @@
 // SRC/index.js — Sol Burn Bot (Bitquery v2 EAP)
-// ALL SOL: filters in SOL, values in SOL, MCAP filter in SOL
-// Primary price: Birdeye (with API key). DexScreener only for enrich (mcap/liquidity/socials).
-// 429/503 backoff + caches + limited price lookups.
+// ALL SOL mode: filters in SOL, values in SOL, only post when LP is fully burned (liqUsd == 0)
+// Prices from Birdeye (with API key). DexScreener only for enrich (mcap/liquidity/socials).
+// Includes backoff + caches, and admin commands.
 
 import 'dotenv/config';
 import fetch from 'node-fetch';
@@ -14,9 +14,9 @@ const {
   BOT_TOKEN,
   CHANNEL_ID,
   BITQUERY_API_KEY,
-  BIRDEYE_API_KEY,               // required for stable prices
-  MIN_SOL = '0',                 // threshold on burn value (in SOL); 0 = off
-  MAX_MCAP_SOL = '0',            // max FDV/MCAP in SOL; 0 = off
+  BIRDEYE_API_KEY,
+  MIN_SOL = '0',          // burn threshold in SOL (0 = off)
+  MAX_MCAP_SOL = '0',     // max FDV/MCAP in SOL (0 = off)
   POLL_INTERVAL_SEC = '20',
   POLL_LOOKBACK_SEC = '25',
   DEDUP_MINUTES = '10',
@@ -29,7 +29,7 @@ if (!BITQUERY_API_KEY) throw new Error('Missing BITQUERY_API_KEY');
 if (!BIRDEYE_API_KEY) console.warn('[WARN] No BIRDEYE_API_KEY provided. Prices may fail.');
 
 /* ========= Admin ========= */
-const ADMIN_IDS = [1721507540]; // <- your Telegram user id
+const ADMIN_IDS = [1721507540]; // your Telegram user id
 const isAdmin = (ctx) => !!(ctx?.from && ADMIN_IDS.includes(ctx.from.id));
 
 /* ========= Globals ========= */
@@ -50,8 +50,7 @@ const seen = new Map(); // sig::mint -> ts
 // caches
 const PRICE_TTL_MS = 60_000;
 const priceCache = new Map();   // token mint -> { usdPrice, ts }
-const solUsdCache = { price: null, ts: 0 }; // SOL/USD
-
+const solUsdCache = { price: null, ts: 0 }; // SOL/USD cache
 const MAX_PRICE_LOOKUPS_PER_POLL = 6;
 
 setInterval(()=>console.log('[HEARTBEAT]', new Date().toISOString()), 15000);
@@ -59,9 +58,8 @@ setInterval(()=>console.log('[HEARTBEAT]', new Date().toISOString()), 15000);
 /* ========= Helpers ========= */
 const short = s => (s && s.length > 12 ? s.slice(0,4)+'...'+s.slice(-4) : s);
 const fmtSol = (x, frac=4) => (x==null ? 'n/a' : Number(x).toLocaleString(undefined,{maximumFractionDigits:frac})+' SOL');
-const fmtUsd = (x, frac=0) => (x==null ? 'n/a' : '$'+Number(x).toLocaleString(undefined,{maximumFractionDigits:frac}));
-const fmtPct = x => (x==null ? 'n/a' : (Number(x)*100).toFixed(2)+'%');
 const fmtNum = (x, frac=0) => (x==null ? 'n/a' : Number(x).toLocaleString(undefined,{maximumFractionDigits:frac}));
+const fmtPct = x => (x==null ? 'n/a' : (Number(x)*100).toFixed(2)+'%');
 const nowMs = () => Date.now();
 const keyFor = (sig, mint) => `${sig||'no-sig'}::${mint||'no-mint'}`;
 
@@ -170,7 +168,7 @@ function parseBurnNodes(nodes){
   return out;
 }
 
-/* ========= Prices via Birdeye ========= */
+/* ========= Prices (Birdeye) ========= */
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 async function getUsdPriceByMint(mint){
@@ -196,7 +194,7 @@ async function getUsdPriceByMint(mint){
   return null;
 }
 
-async function getSolUsd(){ // SOL/USD price
+async function getSolUsd(){
   const now = Date.now();
   if (solUsdCache.price && (now - solUsdCache.ts) < 60_000) return solUsdCache.price;
   try{
@@ -241,7 +239,7 @@ async function enrichDexScreener(mint){
 
     const priceUsd = Number(best?.priceUsd ?? null) || null;
     const liqUsd   = Number(best?.liquidity?.usd ?? null) || null;
-    const fdv      = Number(best?.fdv ?? null) || null; // MCAP/FDV in USD
+    const fdv      = Number(best?.fdv ?? null) || null; // FDV/MCAP in USD
     const ratio    = (fdv && liqUsd) ? (fdv/liqUsd) : null;
     const createdMs = best?.pairCreatedAt ? Number(best.pairCreatedAt) : null;
 
@@ -276,7 +274,7 @@ async function rpcStats(mintStr){
     top10 = arr.slice(0,10).map(v => ({ address: v.address.toBase58(), amount: v.uiAmount }));
     if (supplyUi && supplyUi > 0){
       const sum = top10.reduce((a,c)=>a+(Number(c.amount)||0),0);
-      top10Pct = sum / supplyUi;
+      top10Pct = sum / s;
     }
   }catch(e){}
   try{
@@ -299,81 +297,89 @@ function links(sig, mint, dsUrl){
   return out.join(' | ');
 }
 function renderSecurity(mintRenounced, freezeRenounced){
-  const meta = '├ Mutable Metadata: Unknown';
-  const mint = `├ Mint Authority: ${mintRenounced===true?'No ✅':mintRenounced===false?'Yes ❌':'Unknown'}`;
-  const frz  = `└ Freeze Authority: ${freezeRenounced===true?'No ✅':freezeRenounced===false?'Yes ❌':'Unknown'}`;
-  return `${meta}\n${mint}\n${frz}`;
+  const lines = [];
+  lines.push(`Mutable Metadata: Unknown`);
+  lines.push(`Mint Authority: ${mintRenounced===true?'No':mintRenounced===false?'Yes':'Unknown'}`);
+  lines.push(`Freeze Authority: ${freezeRenounced===true?'No':freezeRenounced===false?'Yes':'Unknown'}`);
+  return lines.join('\n');
 }
 function renderTop(top10, pct, supplyUi){
   if (!top10?.length) return 'n/a';
   const lines = top10.map((h)=>{
     const perc = (supplyUi && h.amount!=null) ? ` | ${(Number(h.amount)/supplyUi*100).toFixed(2)}%` : '';
-    return `├ \`${short(h.address)}\` | ${fmtNum(h.amount,2)}${perc}`;
+    return `- ${short(h.address)} | ${fmtNum(h.amount,2)}${perc}`;
   });
-  return lines.join('\n') + (pct!=null?`\n└ Top10 share: ${fmtPct(pct)}`:'');
+  if (pct!=null) lines.push(`Top10 share: ${fmtPct(pct)}`);
+  return lines.join('\n');
 }
 
 /* ========= Post (SOL-first) ========= */
 async function postReport(burn){
-  // prices
-  const solUsd = await getSolUsd(); // USD per 1 SOL
+  // 1) árak
+  const solUsd = await getSolUsd(); // USD per SOL
   let tokenUsd = null;
   if (burn.mint) tokenUsd = await getUsdPriceByMint(burn.mint);
 
-  // burn value in SOL
+  // 2) burn érték SOL-ban
   let burnSol = null;
   if (typeof burn.amount==='number' && burn.amount>0 && tokenUsd!=null && solUsd){
     burnSol = (burn.amount * tokenUsd) / solUsd;
   }
 
-  // threshold by SOL (if MIN_SOL <= 0 -> always pass)
+  // 3) MIN_SOL szűrő
   const meetsMinSol = (cfg.minSol <= 0) ? true : (burnSol != null && burnSol >= cfg.minSol);
   if (!meetsMinSol){
-    console.log(`[SKIP<${cfg.minSol} SOL] ${short(burn.sig)} mint=${short(burn.mint)} amount=${burn.amount} burnSol=${burnSol}`);
+    console.log(`[SKIP < MIN_SOL] sig=${short(burn.sig)} mint=${short(burn.mint)} burnSol=${burnSol}`);
     return false;
   }
 
-  // enrich for MCAP filter and UI
+  // 4) Enrichment (DexScreener)
   const ds = burn.mint ? await enrichDexScreener(burn.mint) : null;
 
-  // MCAP (FDV) in SOL and filter
+  // 5) LP 100% burn ellenőrzés: csak akkor posztolunk, ha liqUsd == 0
+  //    (Ha nincs adat a liquidity-re, NEM posztolunk.)
+  if (!(ds && ds.liqUsd === 0)) {
+    console.log(`[SKIP LP not fully burned] sig=${short(burn.sig)} mint=${short(burn.mint)} liqUsd=${ds?.liqUsd}`);
+    return false;
+  }
+
+  // 6) MCAP szűrő SOL-ban (ha van adat)
   let mcapSol = null;
   if (ds?.fdv && solUsd) mcapSol = ds.fdv / solUsd;
   const hasMax = cfg.maxMcapSol > 0;
   if (hasMax && mcapSol != null && mcapSol > cfg.maxMcapSol){
-    console.log(`[SKIP mcap>${cfg.maxMcapSol} SOL] ${short(burn.sig)} mint=${short(burn.mint)} mcapSol=${mcapSol.toFixed(2)}`);
+    console.log(`[SKIP mcap > MAX_MCAP_SOL] sig=${short(burn.sig)} mint=${short(burn.mint)} mcapSol=${mcapSol.toFixed(2)} > ${cfg.maxMcapSol}`);
     return false;
   }
 
-  // RPC stats (supply/holders/security)
+  // 7) RPC stats
   const stats = burn.mint ? await rpcStats(burn.mint) : {};
 
-  // Build message (SOL-first)
+  // 8) Üzenet (szöveges, emoji nélkül)
   const nameLine = ds?.name ? `${ds.name}` : short(burn.mint||'Token');
   const ratio    = ds?.ratio ?? null;
   const tradeStart = ds?.createdMs ? minutesAgo(ds.createdMs) : 'n/a';
   const socials = [ds?.site, ds?.tw, ds?.tg].filter(Boolean).join(' | ') || 'n/a';
 
   const lines = [];
-  lines.push(`${nameLine}`);
+  lines.push(`Token: ${nameLine}`);
+  lines.push(`Trading Start Time: ${tradeStart}`);
   lines.push('');
-  lines.push(`🔥 Burn Percentage: —`);
-  lines.push(`🕒 Trading Start Time: ${tradeStart}`);
-  lines.push('');
-  lines.push(`📊 Marketcap: ${mcapSol!=null?fmtSol(mcapSol,2):'n/a'}`);
-  lines.push(`💧 Liquidity: ${ds?.liqUsd!=null && solUsd ? fmtSol(ds.liqUsd/solUsd,2) : 'n/a'}${ratio?` (${fmtNum(ratio,2)} MCAP/LP)`:''}`);
-  lines.push(`💲 Price: ${tokenUsd!=null && solUsd ? fmtSol(tokenUsd/solUsd,6) : 'n/a'}`);
+  lines.push(`Marketcap: ${mcapSol!=null?fmtSol(mcapSol,2):'n/a'}`);
+  lines.push(`Liquidity: 0 SOL (LP fully burned)${ratio?` (${fmtNum(ratio,2)} MCAP/LP)`:''}`);
+  lines.push(`Price: ${tokenUsd!=null && solUsd ? fmtSol(tokenUsd/solUsd,6) : 'n/a'}`);
   lines.push('');
   if (typeof burn.amount==='number'){
-    lines.push(`🔥 Burned Amount: ${fmtNum(burn.amount,4)}  (~${burnSol!=null?fmtSol(burnSol,4):'n/a'})`);
+    lines.push(`Burned Amount: ${fmtNum(burn.amount,4)}  (~${burnSol!=null?fmtSol(burnSol,4):'n/a'})`);
   }
   lines.push('');
-  lines.push(`📦 Total Supply: ${fmtNum(stats?.supplyUi,0)}`);
+  lines.push(`Total Supply: ${fmtNum(stats?.supplyUi,0)}`);
   lines.push('');
-  lines.push(`🌐 Socials: ${socials}    ⚙️ Security:`);
+  lines.push(`Socials: ${socials}`);
+  lines.push(`Security:`);
   lines.push(renderSecurity(stats?.mintRenounced, stats?.freezeRenounced));
   lines.push('');
-  lines.push(`👑 Top Holders:`);
+  lines.push(`Top Holders:`);
   lines.push(renderTop(stats?.top10, stats?.top10Pct, stats?.supplyUi));
   lines.push('');
   lines.push(links(burn.sig, burn.mint, ds?.url));
@@ -382,7 +388,7 @@ async function postReport(burn){
   const text = lines.join('\n');
   try{
     await bot.telegram.sendMessage(CHANNEL_ID, text, { parse_mode:'Markdown', disable_web_page_preview:true });
-    console.log(`[POSTED] ${short(burn.sig)} ~${burnSol!=null?burnSol.toFixed(4):'n/a'} SOL`);
+    console.log(`[POSTED] sig=${short(burn.sig)} burnSol=${burnSol!=null?burnSol.toFixed(4):'n/a'} SOL`);
     return true;
   }catch(e){
     console.error('[sendMessage ERROR]', e?.description || e?.message || e);
@@ -431,7 +437,7 @@ bot.command('status', (ctx)=>{
     `POLL_INTERVAL_SEC=${cfg.pollIntervalSec}`,
     `POLL_LOOKBACK_SEC=${cfg.lookbackSec}`,
     `DEDUP_MINUTES=${cfg.dedupMinutes}`,
-    `Price Source: Birdeye only`
+    `LP filter: only post when liqUsd == 0`
   ].join('\n'));
 });
 bot.command('setminsol', (ctx)=>{
@@ -462,11 +468,12 @@ bot.command('setmaxmcap', (ctx)=>{
     await bot.telegram.sendMessage(
       CHANNEL_ID,
       [
-        '✅ BurnBot started (SOL mode)',
-        `MIN_SOL ≥ ${cfg.minSol} SOL`,
-        `MAX_MCAP_SOL ${cfg.maxMcapSol>0?('≤ '+cfg.maxMcapSol+' SOL'):'off'}`,
+        'BurnBot started (SOL mode)',
+        `MIN_SOL >= ${cfg.minSol} SOL`,
+        `MAX_MCAP_SOL ${cfg.maxMcapSol>0?('<= '+cfg.maxMcapSol+' SOL'):'off'}`,
         `Poll=${cfg.pollIntervalSec}s  Window=${cfg.lookbackSec}s  Dedup=${cfg.dedupMinutes}m`,
-        `Price: Birdeye`
+        'LP filter: only when LP fully burned (liqUsd == 0)',
+        'Price: Birdeye'
       ].join('\n')
     );
   }catch(e){ console.error('[startup send error]', e?.message); }
