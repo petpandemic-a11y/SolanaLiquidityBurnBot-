@@ -8,14 +8,41 @@ const CHANNEL_ID = process.env.CHANNEL_ID;
 const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
 
 const BITQUERY_URL = "https://graphql.bitquery.io";
+const RAYDIUM_API = "https://api.raydium.io/v2/sdk/liquidity/mainnet.json";
+const ORCA_API = "https://api.orca.so/pools";
 
-async function fetchLPBurns(limit = 20) {
+let LP_TOKENS = [];
+
+// 🔹 LP poolok automatikus frissítése Raydium + Orca API-ról
+async function updatePools() {
+  try {
+    const [rayRes, orcaRes] = await Promise.all([
+      axios.get(RAYDIUM_API),
+      axios.get(ORCA_API),
+    ]);
+
+    const rayPools = Object.values(rayRes.data).map(p => p.lpMint);
+    const orcaPools = Object.values(orcaRes.data).map(p => p.poolTokenMint);
+
+    LP_TOKENS = [...new Set([...rayPools, ...orcaPools])];
+
+    console.log(`✅ LP pool lista frissítve: ${LP_TOKENS.length} pool figyelve.`);
+  } catch (err) {
+    console.error("LP pool frissítési hiba:", err.message);
+  }
+}
+
+// 🔹 LP burn tranzakciók lekérése Bitquery v2 API-ból
+async function fetchLPBurns(limit = 30) {
+  if (LP_TOKENS.length === 0) return [];
+
   const query = `
-    query LPBurns($limit: Int!) {
+    query LPBurns($limit: Int!, $lpTokens: [String!]) {
       solana {
         transfers(
           options: {limit: $limit, desc: "block.timestamp.time"}
           transferType: burn
+          currency: {in: $lpTokens}
         ) {
           block {
             timestamp {
@@ -45,7 +72,7 @@ async function fetchLPBurns(limit = 20) {
   try {
     const res = await axios.post(
       BITQUERY_URL,
-      { query, variables: { limit } },
+      { query, variables: { limit, lpTokens: LP_TOKENS } },
       {
         headers: {
           "Content-Type": "application/json",
@@ -61,20 +88,20 @@ async function fetchLPBurns(limit = 20) {
   }
 }
 
+// 🔹 LP burn események figyelése és posztolása Telegramra
 async function checkBurnEvents() {
   console.log("🔄 Ellenőrzés indul...");
 
-  const burns = await fetchLPBurns(20);
+  const burns = await fetchLPBurns(30);
 
   for (const burn of burns) {
     const msg = `
 🔥 *LP Token Burn Detected!* 🔥
 
 💎 *Token:* ${burn.currency.name} (${burn.currency.symbol})
-📜 *Contract:* \`${burn.currency.address}\`
-📤 *Sender:* \`${burn.sender.address}\`
+📜 *LP Token Contract:* \`${burn.currency.address}\`
 📥 *Burn Address:* \`${burn.receiver.address}\`
-💰 *Amount:* ${burn.amount}
+💰 *Amount Burned:* ${burn.amount}
 ⏰ *Time:* ${burn.block.timestamp.time}
 🔗 [Tx on Solscan](https://solscan.io/tx/${burn.transaction.signature})
     `;
@@ -83,4 +110,7 @@ async function checkBurnEvents() {
   }
 }
 
-setInterval(checkBurnEvents, 10000);
+// 🔹 Indítás
+await updatePools();
+setInterval(updatePools, 3600 * 1000);
+setInterval(checkBurnEvents, 10 * 1000);
