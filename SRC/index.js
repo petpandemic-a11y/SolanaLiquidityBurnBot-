@@ -1,125 +1,103 @@
-import dotenv from "dotenv";
-import TelegramBot from "node-telegram-bot-api";
-import WebSocket from "ws";
-import fetch from "node-fetch";
+import 'dotenv/config';
+import fetch from 'node-fetch';
+import TelegramBot from 'node-telegram-bot-api';
 
-dotenv.config();
-
-// ---- Environment változók ----
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const CHANNEL_ID = process.env.CHANNEL_ID;
+// --- ENV változók ---
+const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN;
+const TELEGRAM_CHANNEL_ID = process.env.CHANNEL_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
-if (!BOT_TOKEN || !CHANNEL_ID || !HELIUS_API_KEY) {
-  console.error("❌ Hiányzik egy vagy több environment változó!");
-  process.exit(1);
-}
+// --- Telegram bot inicializálás ---
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: false });
-
-// ---- Solana burn címek ----
+// --- Burn address lista ---
 const BURN_ADDRESSES = [
-  "11111111111111111111111111111111",
-  "1nc1nerator11111111111111111111111111111",
-  "BurnXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX11111"
+  "1nc1nerator11111111111111111111111111111111",
+  "11111111111111111111111111111111"
 ];
 
-// ---- Helius WebSocket URL ----
-const HELIUS_WS = `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-const ws = new WebSocket(HELIUS_WS);
-
-// LP tokenek mint-jeinek lekérése Raydiumtól
-let lpTokens = [];
-
-async function fetchLPTokens() {
+// --- Induláskor tesztüzenet ---
+(async () => {
   try {
-    const res = await fetch("https://api.raydium.io/v2/sdk/liquidity/mainnet.json");
-    const pools = await res.json();
-
-    lpTokens = Object.values(pools).map((pool) => pool.lpMint);
-    console.log(`✅ ${lpTokens.length} LP token mint beállítva Raydiumról`);
-  } catch (err) {
-    console.error("❌ LP token lista letöltési hiba:", err);
+    await bot.sendMessage(TELEGRAM_CHANNEL_ID, "🔥 Bot elindult és figyeli az LP-burn eseményeket!");
+    console.log("✅ Tesztüzenet elküldve Telegramra!");
+  } catch (error) {
+    console.error("❌ Nem sikerült Telegramra írni:", error.message);
   }
-}
+})();
 
-// Feliratkozás WebSocketre
-ws.on("open", async () => {
-  console.log("🔗 Kapcsolódva a Helius WebSockethez!");
-  await fetchLPTokens();
-
-  ws.send(
-    JSON.stringify({
-      jsonrpc: "2.0",
-      id: "lp-burn-tracker",
-      method: "transactionSubscribe",
-      params: [{ commitment: "confirmed" }]
-    })
-  );
-});
-
-// Tranzakciók figyelése
-ws.on("message", async (msg) => {
+// --- LP-burn figyelő ---
+async function checkLPBurns() {
   try {
-    const data = JSON.parse(msg);
-    const tx = data?.params?.result;
-    if (!tx) return;
+    console.log("🔄 Lekérdezés indul a Helius RPC-n...");
 
-    const instructions = tx.transaction.message.instructions || [];
-    for (const ix of instructions) {
-      if (ix.program !== "spl-token") continue;
+    const response = await fetch(HELIUS_RPC, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "helius-test",
+        method: "getSignaturesForAddress",
+        params: [
+          "TokenkProgram11111111111111111111111111111", // SPL Token program
+          { limit: 10 }
+        ]
+      })
+    });
 
-      const info = ix.parsed?.info;
-      if (!info) continue;
+    const data = await response.json();
 
-      const { destination, amount, mint } = info;
+    if (!data.result) {
+      console.error("⚠️ Nincs adat a Helius RPC-től!");
+      return;
+    }
 
-      // Csak LP tokenek figyelése
-      if (!lpTokens.includes(mint)) continue;
+    for (const tx of data.result) {
+      console.log("📌 Tranzakció:", tx.signature);
 
-      // Csak burn címekre menő utalások
-      if (BURN_ADDRESSES.includes(destination)) {
-        // Lekérdezzük a jelenlegi LP token supply-t
-        const supplyRes = await fetch(`https://api.mainnet-beta.solana.com`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            id: 1,
-            method: "getTokenSupply",
-            params: [mint]
-          })
-        });
+      // Ellenőrizzük, hogy van-e token burn
+      const detailsResponse = await fetch(HELIUS_RPC, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: "helius-tx",
+          method: "getTransaction",
+          params: [tx.signature, { encoding: "jsonParsed" }]
+        })
+      });
 
-        const supplyData = await supplyRes.json();
-        const remainingSupply = Number(supplyData.result.value.amount);
+      const details = await detailsResponse.json();
+      if (!details.result?.meta) continue;
 
-        // Csak akkor küldünk értesítést, ha teljes burn történt
-        if (remainingSupply === 0) {
+      const postTokenBalances = details.result.meta.postTokenBalances || [];
+      const preTokenBalances = details.result.meta.preTokenBalances || [];
+
+      if (preTokenBalances.length > 0 && postTokenBalances.length === 0) {
+        // Lehetséges LP-burn — ellenőrizzük, hova ment
+        const accounts = details.result.transaction.message.accountKeys;
+        const burnAccount = accounts.find(a => BURN_ADDRESSES.includes(a.pubkey));
+
+        if (burnAccount) {
+          console.log("🔥 LP token teljesen burnolva:", tx.signature);
+
           const message = `
-🔥 **100% LP BURN ESEMÉNY** 🔥
-
-🌐 LP Mint: \`${mint}\`
-💧 Elégetett mennyiség: ${amount}
-🪦 Burn cím: \`${destination}\`
+🔥 **LP BURN ÉSZLELVE!**
 🔗 [Tranzakció](https://solscan.io/tx/${tx.signature})
+📍 Burn cím: \`${burnAccount.pubkey}\`
           `;
 
-          await bot.sendMessage(CHANNEL_ID, message, { parse_mode: "Markdown" });
-          console.log("✅ LP burn értesítés elküldve!");
+          await bot.sendMessage(TELEGRAM_CHANNEL_ID, message, { parse_mode: "Markdown" });
         }
       }
     }
-  } catch (err) {
-    console.error("❌ Hiba a tranzakció feldolgozásakor:", err);
+  } catch (error) {
+    console.error("❌ Hiba a lekérdezésben:", error.message);
   }
-});
+}
 
-ws.on("error", (err) => {
-  console.error("❌ Helius WebSocket hiba:", err);
-});
-
-ws.on("close", () => {
-  console.log("⚠️ WebSocket kapcsolat bontva. Újracsatlakozás 5 mp múlva...");
-  setTimeout(() => ws.connect(HELIUS_WS), 5000);
-});
+// --- Időzített lekérdezés 20 mp-enként ---
+setInterval(checkLPBurns, 20000);
