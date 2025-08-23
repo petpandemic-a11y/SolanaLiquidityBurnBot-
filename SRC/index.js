@@ -2,23 +2,23 @@
 // Features:
 // - Admin guard (only specific Telegram user IDs can control the bot).
 // - Bitquery v2 EAP (TokenSupplyUpdates) polling with robust GraphQL error handling.
-// - Amount normalization (abs, decimals → UI), USD estimation via Jupiter → DexScreener fallback.
+// - Amount normalization (abs, decimals -> UI), USD estimation via Jupiter -> DexScreener fallback.
 // - Enrichment via DexScreener (price, liquidity, FDV, socials, pair URL).
 // - RPC stats (total supply, top 10 holders, mint/freeze authority renounced checks).
 // - Deduplication window for already posted txs.
 // - Detailed logs: HEARTBEAT, POLL start/end, Bitquery counts, POSTED, SKIP, and errors.
-// - Safe Telegram send (no markdown parsing) to avoid formatting crashes.
+// - Safe Telegram send (no markdown) to avoid formatting crashes.
 // - Commands: /ping, /ver, /post, /setmin, /status, /debug, /force, /forceburn.
 //
-// Usage (Render):
+// Render setup:
 //  - Background Worker (not Web Service).
 //  - Start command: npm start
 //  - package.json: { "scripts": { "start": "node SRC/index.js" } }
-//  - ENV required:
-//      BOT_TOKEN           -> Telegram bot token from BotFather
+//  - Required ENV:
+//      BOT_TOKEN           -> Telegram bot token (BotFather)
 //      CHANNEL_ID          -> Telegram channel numeric id (e.g. -1002778911061)
 //      BITQUERY_API_KEY    -> Bitquery v2 EAP access token (starts with ory_at_...)
-//    Optional:
+//    Optional ENV:
 //      MIN_USD             -> default "30"; set "0" for testing (post everything)
 //      POLL_INTERVAL_SEC   -> default "10"
 //      POLL_LOOKBACK_SEC   -> default "12"
@@ -26,9 +26,9 @@
 //      RPC_URL             -> optional custom Solana RPC (Helius/Triton/etc)
 //
 // Notes:
-//  - Avoid running multiple instances with the same BOT_TOKEN (will cause 409 getUpdates conflicts).
-//  - Ensure the bot is Admin on the target channel with "Post messages" permission.
-//  - CHANNEL_ID should be numeric -100..., not @handle, for reliability.
+//  - Do not run multiple instances with the same BOT_TOKEN (409 Conflict).
+//  - Bot must be Admin on the channel (Post messages).
+//  - Prefer numeric CHANNEL_ID (-100...), not @handle.
 
 import 'dotenv/config';
 import fetch from 'node-fetch';
@@ -58,13 +58,13 @@ if (!BITQUERY_API_KEY) throw new Error('Missing BITQUERY_API_KEY');
    ADMIN GUARD
    ============================== */
 // Only these Telegram user IDs may use control commands
-const ADMIN_IDS = [1721507540]; // << állítsd a saját user ID-dra
+const ADMIN_IDS = [1721507540]; // set your own Telegram user id here
 const isAdmin = (ctx) => !!(ctx?.from && ADMIN_IDS.includes(ctx.from.id));
 
 /* ==============================
    GLOBALS
    ============================== */
-const BUILD_TAG = 'build-2025-08-23-full-debug-v2';
+const BUILD_TAG = 'build-2025-08-23-full-debug-v3';
 
 const bot = new Telegraf(BOT_TOKEN);
 const connection = new Connection(RPC_URL || clusterApiUrl('mainnet-beta'), 'confirmed');
@@ -122,7 +122,7 @@ function pruneSeen(){
 const priceCache = new Map(); // mint -> { price, ts, source }
 const PRICE_TTL_MS = 60_000;
 
-// Ha zavar a Jupiter logja, állítsd false-ra:
+// If Jupiter DNS issues spam logs, set to false
 const PRICE_USE_JUPITER = true;
 
 async function priceFromJupiter(mint){
@@ -220,7 +220,7 @@ function parseBurnNodes(nodes){
     const rawUsd = numOrNull(tu?.AmountInUSD);
     const absUsd = rawUsd!=null ? Math.abs(rawUsd) : null;
 
-    // if huge integer & decimals>0 → assume base units and scale to UI
+    // if huge integer & decimals>0 -> assume base units and scale to UI
     let amountUi = absRawAmt;
     if (absRawAmt!=null && decimals>0) {
       const isInt = Number.isInteger(absRawAmt);
@@ -347,24 +347,24 @@ async function postReport(burn){
   const socials = [ds?.site, ds?.tw, ds?.tg].filter(Boolean).join(' | ') || 'n/a';
 
   const lines=[];
-  lines.push(`🔥 Burn Percentage: —`);
-  lines.push(`🕒 Trading Start Time: ${tradeStart}`);
+  lines.push(`Burn Percentage: —`);
+  lines.push(`Trading Start Time: ${tradeStart}`);
   lines.push('');
-  lines.push(`📊 Marketcap: ${fmtUsd(mcap,0)}`);
-  lines.push(`💧 Liquidity: ${fmtUsd(liq,0)}${ratio?` (${ratio?.toFixed(2)} MCAP/LP)`:''}`);
-  lines.push(`💲 Price: ${price!=null?fmtUsd(price,6):'n/a'}`);
+  lines.push(`Marketcap: ${fmtUsd(mcap,0)}`);
+  lines.push(`Liquidity: ${fmtUsd(liq,0)}${ratio?` (${ratio?.toFixed(2)} MCAP/LP)`:''}`);
+  lines.push(`Price: ${price!=null?fmtUsd(price,6):'n/a'}`);
   if (typeof burn.amount==='number'){
     lines.push('');
-    lines.push(`🔥 Burned Amount: ${fmtNum(burn.amount,4)} (~${usd!=null?fmtUsd(usd,0):'n/a'})`);
+    lines.push(`Burned Amount: ${fmtNum(burn.amount,4)} (~${usd!=null?fmtUsd(usd,0):'n/a'})`);
   }
   lines.push('');
-  lines.push(`📦 Total Supply: ${fmtNum(stats?.supplyUi,0)}`);
+  lines.push(`Total Supply: ${fmtNum(stats?.supplyUi,0)}`);
   lines.push('');
-  lines.push(`🌐 Socials: ${socials}`);
-  lines.push('⚙️ Security:');
+  lines.push(`Socials: ${socials}`);
+  lines.push('Security:');
   lines.push(renderSecurity(stats?.mintRenounced, stats?.freezeRenounced));
   lines.push('');
-  lines.push('💰 Top Holders:');
+  lines.push('Top Holders:');
   lines.push(renderTop(stats?.top10, stats?.top10Pct));
   lines.push('');
   lines.push(links(burn.sig, burn.mint, ds?.url));
@@ -374,7 +374,7 @@ async function postReport(burn){
 
   try {
     await bot.telegram.sendMessage(CHANNEL_ID, text, { disable_web_page_preview: true });
-    console.log(`[POSTED] sig=${short(burn.sig)} usd≈${usd!=null?usd.toFixed(2):'n/a'} mint=${short(burn.mint)} amount=${burn.amount}`);
+    console.log(`[POSTED] sig=${short(burn.sig)} usd~${usd!=null?usd.toFixed(2):'n/a'} mint=${short(burn.mint)} amount=${burn.amount}`);
     return true;
   } catch (e) {
     console.error('[sendMessage ERROR]', e?.description || e?.message || e);
@@ -420,28 +420,28 @@ bot.command('ping', (ctx)=>ctx.reply('pong'));
 bot.command('ver',  (ctx)=>ctx.reply(`OK • ${BUILD_TAG}`));
 
 bot.command('post', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.reply('❌ No permission.');
+  if (!isAdmin(ctx)) return ctx.reply('No permission.');
   const text = (ctx.message?.text || '').split(' ').slice(1).join(' ') || 'Test message';
   try {
-    await bot.telegram.sendMessage(CHANNEL_ID, `🔔 TEST: ${text}`, { disable_web_page_preview: true });
-    await ctx.reply('✅ Sent to channel.');
+    await bot.telegram.sendMessage(CHANNEL_ID, `TEST: ${text}`, { disable_web_page_preview: true });
+    await ctx.reply('Sent to channel.');
   } catch (e) {
-    await ctx.reply(`❌ Error: ${e?.description || e?.message}`);
+    await ctx.reply(`Error: ${e?.description || e?.message}`);
   }
 });
 
 bot.command('setmin', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.reply('❌ No permission.');
+  if (!isAdmin(ctx)) return ctx.reply('No permission.');
   const v = Number((ctx.message?.text || '').split(' ')[1]);
   if (!Number.isFinite(v) || v < 0) return ctx.reply('Usage: /setmin <usd>');
   cfg.minUsd = v;
-  ctx.reply(`✅ MIN_USD set to $${v}`);
+  ctx.reply(`MIN_USD set to $${v}`);
 });
 
 bot.command('status', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.reply('❌ No permission.');
+  if (!isAdmin(ctx)) return ctx.reply('No permission.');
   const s = [
-    '⚙️ Settings:',
+    'Settings:',
     `• MIN_USD = $${cfg.minUsd}`,
     `• POLL_INTERVAL_SEC = ${cfg.pollIntervalSec}s`,
     `• POLL_LOOKBACK_SEC = ${cfg.lookbackSec}s`,
@@ -451,7 +451,7 @@ bot.command('status', async (ctx) => {
 });
 
 bot.command('debug', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.reply('❌ No permission.');
+  if (!isAdmin(ctx)) return ctx.reply('No permission.');
   try {
     const json = await bitqueryFetch(GQL(60));
     const nodes = json?.data?.Solana?.TokenSupplyUpdates || [];
@@ -467,26 +467,27 @@ bot.command('debug', async (ctx) => {
       preview.push(`- ${b.sig ? b.sig.slice(0,8)+'…' : 'no-sig'} | mint=${b.mint || 'n/a'} | amount=${b.amount ?? 'n/a'} | usd=${usd ?? b.amountUsd ?? 'n/a'}`);
     }
 
-    let msg = `🧪 Debug: last 60s\n• Nodes: ${nodes.length}\n• Parsed burns: ${burns.length}`;
-    if (preview.length) msg += `\n\nMinták:\n${preview.join('\n')}`;
+    let msg = `Debug: last 60s\n• Nodes: ${nodes.length}\n• Parsed burns: ${burns.length}`;
+    if (preview.length) msg += `\n\nSamples:\n${preview.join('\n')}`;
     return ctx.reply(msg);
   } catch (e) {
-    return ctx.reply(`❌ Bitquery error: ${e?.message || String(e)}`);
+    return ctx.reply(`Bitquery error: ${e?.message || String(e)}`);
   }
 });
 
 // FORCE: simple test to channel, no Bitquery
 bot.command('force', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.reply('❌ No permission.');
+  if (!isAdmin(ctx)) return ctx.reply('No permission.');
   try {
     const msg = `FORCE TEST\nat=${new Date().toISOString()}`;
     await bot.telegram.sendMessage(CHANNEL_ID, msg, { disable_web_page_preview: true });
-    return ctx.reply('✅ Force (simple) sent to channel.');
+    return ctx.reply('Force (simple) sent to channel.');
   } catch (e) {
-    return ctx.reply(`❌ Force (simple) error: ${e?.description || e?.message || String(e)}`);
+    return ctx.reply(`Force (simple) error: ${e?.description || e?.message || String(e)}`);
   }
 });
-// FORCEBURN: Bitquery-based forced post (fixed, no emojis)
+
+// FORCEBURN: Bitquery-based forced post (fixed, ASCII only)
 bot.command('forceburn', async (ctx) => {
   if (!isAdmin(ctx)) return ctx.reply('No permission.');
   try {
@@ -517,3 +518,5 @@ bot.command('forceburn', async (ctx) => {
     return ctx.reply(`Forceburn error: ${e?.message || String(e)}`);
   }
 });
+
+/* ====
