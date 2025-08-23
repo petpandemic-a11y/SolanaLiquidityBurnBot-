@@ -1,7 +1,7 @@
 {
   "name": "solana-burn-bot-bitquery",
   "version": "1.0.0",
-  "description": "Telegram bot for Solana burns (Bitquery v2, SOL mode, LP=0 only).",
+  "description": "Telegram bot for Solana burns (Bitquery v2, SOL mode, LP filter strict/relaxed).",
   "main": "SRC/index.js",
   "scripts": {
     "start": "node SRC/index.js"
