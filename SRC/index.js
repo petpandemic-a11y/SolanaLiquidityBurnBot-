@@ -7,7 +7,7 @@
 const dotenv = require("dotenv");
 dotenv.config();
 
-const fetch = require("node-fetch");
+const { fetch } = require("undici"); // garantáltan függvény CommonJS-ben
 const { Telegraf } = require("telegraf");
 const { Connection, PublicKey, clusterApiUrl } = require("@solana/web3.js");
 const { getMint } = require("@solana/spl-token");
