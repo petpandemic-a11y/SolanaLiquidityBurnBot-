@@ -1,16 +1,14 @@
 {
   "name": "solana-liquidity-burn-bot",
   "version": "1.0.0",
-  "description": "Telegram bot, ami figyeli az LP tokenek elégetését Solanán.",
-  "main": "SRC/index.js",
   "type": "module",
+  "main": "SRC/index.js",
   "scripts": {
     "start": "node SRC/index.js"
   },
   "dependencies": {
-    "dotenv": "^16.4.5",
     "node-fetch": "^3.3.2",
-    "telegraf": "^4.12.2",
-    "ws": "^8.15.1"
+    "ws": "^8.16.0",
+    "node-telegram-bot-api": "^0.61.0"
   }
 }
