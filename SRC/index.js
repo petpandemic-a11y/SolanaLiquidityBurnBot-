@@ -9,23 +9,17 @@ const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
 
 const BITQUERY_URL = "https://graphql.bitquery.io";
 
-const LP_POOLS = [
-  "So11111111111111111111111111111111111111112", // Solana USDC LP pool
-  "Ray111111111111111111111111111111111111111"  // Raydium LP pool
-];
-
-async function fetchLPBurns(poolAddress) {
+async function fetchLPBurns(limit = 20) {
   const query = `
-    query {
-      solana(network: solana) {
+    query LPBurns($limit: Int!) {
+      solana {
         transfers(
-          options: {desc: "block.timestamp.time", limit: 20}
+          options: {limit: $limit, desc: "block.timestamp.time"}
           transferType: burn
-          sender: {is: "${poolAddress}"}
         ) {
           block {
             timestamp {
-              time(format: "%Y-%m-%d %H:%M:%S")
+              time
             }
           }
           currency {
@@ -34,6 +28,9 @@ async function fetchLPBurns(poolAddress) {
             name
           }
           amount
+          sender {
+            address
+          }
           receiver {
             address
           }
@@ -48,18 +45,18 @@ async function fetchLPBurns(poolAddress) {
   try {
     const res = await axios.post(
       BITQUERY_URL,
-      { query },
+      { query, variables: { limit } },
       {
         headers: {
           "Content-Type": "application/json",
-          "Authorization": `Bearer ${BITQUERY_API_KEY}`
+          "Authorization": `Bearer ${BITQUERY_API_KEY}`,
         },
       }
     );
 
-    return res.data.data.solana.transfers || [];
+    return res.data.data?.solana?.transfers || [];
   } catch (e) {
-    console.error("Bitquery API hiba:", e.response?.status, e.response?.data || e.message);
+    console.error("Bitquery API hiba:", e.response?.data || e.message);
     return [];
   }
 }
@@ -67,24 +64,22 @@ async function fetchLPBurns(poolAddress) {
 async function checkBurnEvents() {
   console.log("🔄 Ellenőrzés indul...");
 
-  for (const pool of LP_POOLS) {
-    const burns = await fetchLPBurns(pool);
+  const burns = await fetchLPBurns(20);
 
-    for (const burn of burns) {
-      const msg = `
+  for (const burn of burns) {
+    const msg = `
 🔥 *LP Token Burn Detected!* 🔥
 
 💎 *Token:* ${burn.currency.name} (${burn.currency.symbol})
 📜 *Contract:* \`${burn.currency.address}\`
-📤 *Sender (Pool):* \`${pool}\`
+📤 *Sender:* \`${burn.sender.address}\`
 📥 *Burn Address:* \`${burn.receiver.address}\`
 💰 *Amount:* ${burn.amount}
 ⏰ *Time:* ${burn.block.timestamp.time}
 🔗 [Tx on Solscan](https://solscan.io/tx/${burn.transaction.signature})
-      `;
+    `;
 
-      await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
-    }
+    await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
   }
 }
 
