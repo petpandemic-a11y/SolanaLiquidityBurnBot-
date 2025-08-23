@@ -1,4 +1,4 @@
-// SRC/index.js — PRO bot + /post + /debug
+// SRC/index.js — PRO bot (Bitquery v2) + /post + /debug
 import 'dotenv/config';
 import fetch from 'node-fetch';
 import { Telegraf } from 'telegraf';
@@ -9,7 +9,7 @@ import { getMint } from '@solana/spl-token';
  * ENV:
  *  BOT_TOKEN              Telegram bot token
  *  CHANNEL_ID             Telegram csatorna/chat ID (pl. -1002778911061 VAGY @csatorna)
- *  BITQUERY_API_KEY       Bitquery API v2 token
+ *  BITQUERY_API_KEY       Bitquery API v2 Access Token (ory_at_…)
  *  MIN_USD                min. USD (pl. "30")
  *  POLL_INTERVAL_SEC      poll intervallum sec (default 10)
  *  POLL_LOOKBACK_SEC      időablak sec (default 12)
@@ -69,10 +69,10 @@ async function getUsdPriceByMint(mint){
   return null;
 }
 
-// -------------------- Bitquery GQL --------------------
-const GQL = (sec)=>`
+// -------------------- Bitquery GQL (v2) --------------------
+const GQL = (sec) => `
 query BurnsLastWindow {
-  Solana {
+  Solana(dataset: realtime, network: solana) {
     Instructions(
       where: {
         Instruction: { Program: { Method: { is: "burn" } } }
@@ -83,7 +83,7 @@ query BurnsLastWindow {
     ) {
       Transaction { Signature }
       Block { Time }
-      Instruction { Accounts { Account } }
+      Instruction { Accounts { Address } }
       Call {
         Amount
         AmountInUI
@@ -92,6 +92,27 @@ query BurnsLastWindow {
     }
   }
 }`;
+
+// robusztus fetch+parse Bitqueryhez (v2 Bearer auth)
+async function bitqueryFetch(query){
+  const res = await fetch('https://streaming.bitquery.io/graphql', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${BITQUERY_API_KEY}`, // v2
+    },
+    body: JSON.stringify({ query })
+  });
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {/* not JSON */}
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} ${res.statusText}: ${text.slice(0,200)}`);
+  }
+  if (!json) throw new Error('Invalid/empty JSON from Bitquery');
+  if (json.errors) throw new Error(`GraphQL: ${JSON.stringify(json.errors)}`);
+  return json;
+}
 
 function parseBurnNodes(nodes){
   const out = [];
@@ -106,7 +127,7 @@ function parseBurnNodes(nodes){
     let amount = (typeof call?.AmountInUI==='number') ? call.AmountInUI : null;
 
     if (!mint){
-      const accs = ins?.Accounts?.map(a=>a?.Account).filter(Boolean) || [];
+      const accs = ins?.Accounts?.map(a=>a?.Address).filter(Boolean) || [];
       if (accs.length >= 1) mint = accs[0];
     }
     if (!amount && typeof call?.Amount==='number' && typeof decimals==='number'){
@@ -249,7 +270,7 @@ async function postReport(burn){
 
   const text = lines.join('\n');
   await bot.telegram.sendMessage(CHANNEL_ID, text, { parse_mode:'Markdown', disable_web_page_preview:true });
-  console.log(`[POSTED] ${burn.sig} ~$${usd?.toFixed(2)} mint=${short(burn.mint)}`);
+  console.log(`[POSTED] ${burn.sig} ~${fmtUsd(usd)} mint=${short(burn.mint)}`);
   return true;
 }
 
@@ -259,16 +280,7 @@ async function pollOnce(){
   for (const [k,ts] of Array.from(seen.entries())) if (t - ts > dedupMs) seen.delete(k);
 
   try{
-    const res = await fetch('https://streaming.bitquery.io/graphql', {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json', 'X-API-KEY': BITQUERY_API_KEY },
-      body: JSON.stringify({ query: GQL(Number(POLL_LOOKBACK_SEC)) })
-    });
-    const json = await res.json();
-    if (json.errors){
-      console.error('Bitquery error:', JSON.stringify(json.errors));
-      return;
-    }
+    const json = await bitqueryFetch(GQL(Number(POLL_LOOKBACK_SEC)));
     const nodes = json?.data?.Solana?.Instructions || [];
     console.log(`[Bitquery] last ${POLL_LOOKBACK_SEC}s -> ${nodes.length} instructions`);
     const burns = parseBurnNodes(nodes);
@@ -281,21 +293,15 @@ async function pollOnce(){
       if (ok) seen.set(b.sig, nowMs());
     }
   }catch(e){
-    console.error('pollOnce error:', e?.message);
+    console.error('[Bitquery] fetch error:', e?.message);
   }
 }
 
 // -------------------- DEBUG helper + parancs --------------------
 async function debugFetchBurns(seconds = 60) {
   try {
-    const res = await fetch('https://streaming.bitquery.io/graphql', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-API-KEY': process.env.BITQUERY_API_KEY },
-      body: JSON.stringify({ query: GQL(seconds) })
-    });
-    const j = await res.json();
-    if (j.errors) return { ok:false, err: JSON.stringify(j.errors) };
-    const nodes = j?.data?.Solana?.Instructions || [];
+    const json = await bitqueryFetch(GQL(seconds));
+    const nodes = json?.data?.Solana?.Instructions || [];
     const burns = parseBurnNodes(nodes);
     return { ok:true, nodes: nodes.length, burns: burns.length, preview: burns.slice(0,3) };
   } catch (e) {
