@@ -1,45 +1,38 @@
 import fetch from "node-fetch";
-import dotenv from "dotenv";
 import TelegramBot from "node-telegram-bot-api";
+import dotenv from "dotenv";
 
 dotenv.config();
 
-// --- ENV változók ---
-const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN;
-const TELEGRAM_CHANNEL_ID = process.env.CHANNEL_ID;
+// === ENV változók ===
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const CHANNEL_ID = process.env.CHANNEL_ID;
 const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
 
-// --- Telegram Bot inicializálás ---
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
+// === Telegram bot ===
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
-// --- Bitquery API endpoint ---
-const BITQUERY_URL = "https://graphql.bitquery.io";
+// === Bitquery GraphQL URL ===
+const BITQUERY_URL = "https://graphql.bitquery.io/";
 
-// --- GraphQL Query ---
+// === Lekérdezés ===
 const query = `
-query MyQuery {
-  solana {
+query {
+  solana(network: solana) {
     transfers(
-      options: {limit: 5, desc: "block.timestamp.iso8601"},
-      where: {
-        transfer: {currency: {symbol: {is: "SOL"}}},
-        transaction: {result: {eq: "SUCCESS"}}
-      }
+      options: {desc: "block.timestamp.time", limit: 5}
+      transferType: burn
     ) {
-      transfer {
-        amount
-        currency {
-          symbol
-        }
-        sender
-        receiver
+      amount
+      currency {
+        symbol
       }
-      transaction {
-        signature
-        block {
-          timestamp {
-            iso8601
-          }
+      sender {
+        address
+      }
+      block {
+        timestamp {
+          time(format: "%Y-%m-%d %H:%M:%S")
         }
       }
     }
@@ -47,63 +40,50 @@ query MyQuery {
 }
 `;
 
-// --- Bitquery Lekérdezés ---
-async function fetchBurnEvents() {
+// === LP Burn események lekérdezése ===
+async function checkBurnEvents() {
   try {
-    console.log("🔍 Bitquery lekérdezés indul...");
+    console.log("🔍 Ellenőrzés indul...");
 
     const response = await fetch(BITQUERY_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-API-KEY": BITQUERY_API_KEY,
+        "X-API-KEY": BITQUERY_API_KEY
       },
-      body: JSON.stringify({ query }),
+      body: JSON.stringify({ query })
     });
 
-    if (!response.ok) {
-      throw new Error(`Bitquery API hiba: ${response.status}`);
+    const data = await response.json();
+
+    if (data.errors) {
+      console.error("❌ Bitquery GraphQL hiba:", data.errors);
+      return;
     }
 
-    const result = await response.json();
+    const transfers = data.data.solana.transfers;
 
-    if (result.errors) {
-      console.error("❌ Bitquery GraphQL hiba:", result.errors);
-      return [];
+    if (transfers.length === 0) {
+      console.log("ℹ️ Nincs új LP burn esemény.");
+      return;
     }
 
-    return result.data.solana.transfers || [];
+    for (const tx of transfers) {
+      const message = `
+🔥 *Új LP Burn esemény!*
+💰 Token: ${tx.currency.symbol}
+📉 Mennyiség: ${tx.amount}
+📅 Időpont: ${tx.block.timestamp.time}
+🔗 Cím: \`${tx.sender.address}\`
+      `;
+
+      await bot.sendMessage(CHANNEL_ID, message, { parse_mode: "Markdown" });
+      console.log("✅ Üzenet elküldve Telegramra!");
+    }
   } catch (error) {
-    console.error("🔥 Bitquery fetch hiba:", error.message);
-    return [];
+    console.error("⚠️ Nem sikerült lekérdezni a Bitquery API-t:", error.message);
   }
 }
 
-// --- Események feldolgozása és Telegram értesítés ---
-async function processEvents() {
-  const events = await fetchBurnEvents();
-
-  if (events.length === 0) {
-    console.log("ℹ️ Nincs új LP burn esemény.");
-    return;
-  }
-
-  for (const e of events) {
-    const msg = `
-🔥 **Új LP Burn esemény!** 🔥
-
-💸 Mennyiség: ${e.transfer.amount} ${e.transfer.currency.symbol}
-📤 Küldő: ${e.transfer.sender}
-📥 Fogadó: ${e.transfer.receiver}
-🕒 Időpont: ${e.transaction.block.timestamp.iso8601}
-🔗 Tranzakció: https://solscan.io/tx/${e.transaction.signature}
-    `;
-
-    await bot.sendMessage(TELEGRAM_CHANNEL_ID, msg, { parse_mode: "Markdown" });
-    console.log("✅ Új burn esemény elküldve Telegramra!");
-  }
-}
-
-// --- Időzített figyelés ---
-console.log("🚀 LP Burn Bot elindult, figyeli az eseményeket!");
-setInterval(processEvents, 15000); // 15 mp-enként ellenőriz
+// === Időzített lekérdezés ===
+setInterval(checkBurnEvents, 15000);
