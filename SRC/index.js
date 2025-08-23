@@ -3,156 +3,127 @@ import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
 dotenv.config();
 
-// ====== TELEGRAM BOT ======
+// Telegram init
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
 const CHANNEL_ID = process.env.CHANNEL_ID;
-const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
 
-// ====== API URL-ek ======
+// API URLs
 const BITQUERY_URL = "https://graphql.bitquery.io";
-const RAYDIUM_API = "https://api.raydium.io/v2/sdk/liquidity/mainnet.json";
+const RAYDIUM_V3 = "https://api-v3.raydium.io/liquidity/list";
 const ORCA_API = "https://api.orca.so/pools";
+const JUPITER_API = "https://public-api.jup.ag/v6/pools"; // feltételezett publikus endpoint
 
-// ====== AXIOS ALAPBEÁLLÍTÁS ======
-const axiosInstance = axios.create({
-  timeout: 5000, // 5 másodperc
-});
+// Axios instanc e with timeout
+const http = axios.create({ timeout: 5000 });
 
-// ====== LP TOKEN LISTA ======
 let LP_TOKENS = [];
 
-// ====== LP POOL LISTA FRISSÍTÉS ======
+// 1. Frissít LP poolokat (Raydium v3, Orca, Jupiter)
 async function updatePools() {
   console.log("🔹 LP poolok frissítése indul...");
-  let rayPools = [];
-  let orcaPools = [];
+  const pools = [];
 
-  // Raydium poolok
+  // Raydium v3
   try {
-    const rayRes = await axiosInstance.get(RAYDIUM_API);
-    rayPools = Object.values(rayRes.data).map(p => p.lpMint);
-    console.log(`✅ Raydium API OK: ${rayPools.length} pool`);
+    const res = await http.get(RAYDIUM_V3);
+    if (res.data?.data?.pools) {
+      const rayPools = res.data.data.pools.map(p => p.lpMint);
+      pools.push(...rayPools);
+      console.log(`✅ Raydium v3 API OK: ${rayPools.length} pool`);
+    }
   } catch (err) {
-    console.error("❌ Raydium API hiba:", err.code || err.message);
+    console.error("❌ Raydium v3 API hiba:", err.code || err.message);
   }
 
-  // Orca poolok
+  // Orca
   try {
-    const orcaRes = await axiosInstance.get(ORCA_API);
-    orcaPools = Object.values(orcaRes.data).map(p => p.poolTokenMint);
+    const res = await http.get(ORCA_API);
+    const orcaPools = Object.values(res.data).map(p => p.poolTokenMint);
+    pools.push(...orcaPools);
     console.log(`✅ Orca API OK: ${orcaPools.length} pool`);
   } catch (err) {
     console.error("❌ Orca API hiba:", err.code || err.message);
   }
 
-  // LP tokenek egyesítése
-  LP_TOKENS = [...new Set([...rayPools, ...orcaPools])];
-
-  if (LP_TOKENS.length > 0) {
-    console.log(`✅ LP pool lista frissítve: ${LP_TOKENS.length} pool figyelve.`);
-  } else {
-    console.warn("⚠️ Figyelem: nincs elérhető LP pool lista!");
+  // Jupiter (ha elérhető)
+  try {
+    const res = await http.get(JUPITER_API);
+    if (res.data?.data?.pools) {
+      const jupPools = res.data.data.pools.map(p => p.lpMint);
+      pools.push(...jupPools);
+      console.log(`✅ Jupiter API OK: ${jupPools.length} pool`);
+    }
+  } catch (err) {
+    console.error("❌ Jupiter API hiba (elhagyható):", err.code || err.message);
   }
+
+  LP_TOKENS = [...new Set(pools)];
+  console.log(`ℹ️ LP pool lista frissítve, figyelt poolok száma: ${LP_TOKENS.length}`);
 }
 
-// ====== LP BURN LEKÉRÉS ======
+// 2. Lekérdezi az LP burn eseményeket Bitquery v2-n
 async function fetchLPBurns(limit = 30) {
-  if (LP_TOKENS.length === 0) {
-    console.warn("⚠️ Nincs LP pool lista, kihagyjuk a lekérdezést!");
+  if (!LP_TOKENS.length) {
+    console.warn("⚠️ Nincs LP token listája, kihagyjuk...");
     return [];
   }
-
   const query = `
-    query LPBurns($limit: Int!, $lpTokens: [String!]) {
+    query ($limit: Int!, $lpTokens: [String!]) {
       solana {
         transfers(
-          options: {limit: $limit, desc: "block.timestamp.time"}
-          transferType: burn
+          options: {limit: $limit, desc: "block.timestamp.time"},
+          transferType: burn,
           currency: {in: $lpTokens}
         ) {
-          block {
-            timestamp {
-              time
-            }
-          }
-          currency {
-            address
-            symbol
-            name
-          }
+          block { timestamp { time } }
+          currency { address symbol name }
           amount
-          receiver {
-            address
-          }
-          transaction {
-            signature
-          }
+          receiver { address }
+          transaction { signature }
         }
       }
     }
   `;
-
   try {
-    const res = await axiosInstance.post(
-      BITQUERY_URL,
-      { query, variables: { limit, lpTokens: LP_TOKENS } },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${BITQUERY_API_KEY}`,
-        },
-      }
-    );
-
-    const transfers = res.data?.data?.solana?.transfers || [];
-    console.log(`📊 Lekérdezve: ${transfers.length} LP burn esemény.`);
+    const { data } = await http.post(BITQUERY_URL, { query, variables: { limit, lpTokens: LP_TOKENS } }, {
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.BITQUERY_API_KEY}` }
+    });
+    const transfers = data?.data?.solana?.transfers || [];
+    console.log(`📊 Bitquery lekérdezés sikeres – talált események: ${transfers.length}`);
     return transfers;
-  } catch (e) {
-    console.error("❌ Bitquery API hiba:", e.response?.data || e.message);
+  } catch (err) {
+    console.error("❌ Bitquery API hiba:", err.response?.data || err.message);
     return [];
   }
 }
 
-// ====== LP BURN POSZTOLÁS TELEGRAMRA ======
+// 3. Figyeli az eseményeket és posztol Telegramra
 async function checkBurnEvents() {
   console.log("🔄 Ellenőrzés indul...");
-
-  const burns = await fetchLPBurns(30);
-
-  if (burns.length === 0) {
-    console.log("ℹ️ Nincs új LP burn esemény.");
-    return;
-  }
-
+  const burns = await fetchLPBurns();
+  if (!burns.length) return console.log("ℹ Nincs új LP burn esemény.");
   for (const burn of burns) {
     const msg = `
 🔥 *LP Token Burn Detected!* 🔥
 
-💎 *Token:* ${burn.currency.name || "Ismeretlen"} (${burn.currency.symbol || "N/A"})
+💎 *Token:* ${burn.currency.name || "Ismeretlen"} (${burn.currency.symbol || "?"})
 📜 *LP Token Contract:* \`${burn.currency.address}\`
-📥 *Burn Address:* \`${burn.receiver.address}\`
-💰 *Amount Burned:* ${burn.amount}
-⏰ *Time:* ${burn.block.timestamp.time}
-🔗 [Tx on Solscan](https://solscan.io/tx/${burn.transaction.signature})
-    `;
-
+📥 *Burn cím:* \`${burn.receiver.address}\`
+💰 *Mennyiség:* ${burn.amount}
+⏰ *Idő:* ${burn.block.timestamp.time}
+🔗 [Tranzakció](https://solscan.io/tx/${burn.transaction.signature})
+`;
     try {
       await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
-      console.log(`📩 Telegram üzenet elküldve: ${burn.currency.symbol}`);
-    } catch (err) {
-      console.error("❌ Telegram küldési hiba:", err.message);
+      console.log("📩 Telegram üzenet küldve:", burn.currency.symbol);
+    } catch (e) {
+      console.error("❌ Telegram küldési hiba:", e.message);
     }
   }
 }
 
-// ====== BOT INDÍTÁS ======
-console.log("🚀 Solana LP Burn Bot indul...");
-
-// LP pool lista frissítés az induláskor
+// 4. Indítás
+console.log("🚀 LP Burn Bot indul...");
 await updatePools();
-
-// LP pool lista frissítés óránként
 setInterval(updatePools, 3600 * 1000);
-
-// LP burn események figyelése 10 másodpercenként
 setInterval(checkBurnEvents, 10 * 1000);
