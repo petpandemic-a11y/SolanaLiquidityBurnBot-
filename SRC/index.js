@@ -7,76 +7,84 @@ const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
 
-// Retry logika: ne álljon le, ha Birdeye lassú vagy időszakosan hibázik
-async function safeApiCall(url, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const res = await axios.get(url, {
+const BIRDEYE_GRAPHQL = "https://public-api.birdeye.so/graphql";
+
+// GraphQL lekérdezés küldése Birdeye API-ra
+async function birdeyeQuery(query, variables = {}) {
+  try {
+    const res = await axios.post(
+      BIRDEYE_GRAPHQL,
+      { query, variables },
+      {
         headers: {
-          "X-API-KEY": BIRDEYE_API_KEY,
-          "accept": "application/json",
+          "Content-Type": "application/json",
+          "x-api-key": BIRDEYE_API_KEY,
         },
         timeout: 8000,
-      });
-      return res.data;
-    } catch (e) {
-      if (i < retries - 1) {
-        console.warn(`API hiba: ${e.message} → újrapróbálkozás ${i + 1}/${retries}`);
-        await new Promise((r) => setTimeout(r, 3000));
-      } else {
-        console.error(`Birdeye API végleg nem elérhető: ${url}`);
-        return null;
       }
-    }
+    );
+    return res.data.data;
+  } catch (err) {
+    console.error("Birdeye API hiba:", err.message);
+    return null;
   }
 }
 
-// Token részletes infók lekérése
-async function fetchTokenOverview(tokenAddress) {
-  const url = `https://api.birdeye.so/defi/token_overview?address=${tokenAddress}&chain=solana`;
-  const data = await safeApiCall(url);
-  return data?.data || null;
-}
-
-// Token lista lekérése (marketcap szerint)
+// Token lista lekérése (TOP 100 marketcap szerint)
 async function fetchTokenList() {
-  const url = "https://api.birdeye.so/defi/tokenlist?sort=marketcap&sort_type=desc&chain=solana";
-  const data = await safeApiCall(url);
-  return data?.data?.tokens || [];
+  const query = `
+    query TokenList {
+      tokens(chain: "solana", sort: MARKETCAP, limit: 100, order: DESC) {
+        address
+        symbol
+        name
+        liquidityUSD
+      }
+    }
+  `;
+  const data = await birdeyeQuery(query);
+  return data?.tokens || [];
 }
 
-// Fő LP burn figyelő függvény
+// Token részletes adatok (ár, mcap, holders)
+async function fetchTokenDetails(address) {
+  const query = `
+    query TokenDetails($address: String!) {
+      token(chain: "solana", address: $address) {
+        priceUSD
+        marketCapUSD
+        holders
+      }
+    }
+  `;
+  const data = await birdeyeQuery(query, { address });
+  return data?.token || null;
+}
+
+// LP burn figyelő
 async function fetchBurnEvents() {
   console.log("🔄 Ellenőrzés indul...");
 
-  try {
-    const tokens = await fetchTokenList();
+  const tokens = await fetchTokenList();
+  for (const token of tokens) {
+    if (token.liquidityUSD === 0) {
+      const details = await fetchTokenDetails(token.address);
 
-    for (const token of tokens) {
-      const liquidityUSD = token.liquidity || 0;
-
-      // Csak akkor posztolunk, ha a likviditás = 0 → 100% LP burn
-      if (liquidityUSD === 0) {
-        const tokenInfo = await fetchTokenOverview(token.address);
-
-        const msg = `
+      const msg = `
 🔥 *100% LP Burn Detected!* 🔥
 
-💎 *Token:* ${tokenInfo?.name || token.symbol} (${token.symbol})
+💎 *Token:* ${token.name} (${token.symbol})
 📜 *Contract:* \`${token.address}\`
-💰 *Price:* $${tokenInfo?.price?.toFixed(6) || "N/A"}
-📈 *Market Cap:* $${tokenInfo?.mc?.toLocaleString() || "N/A"}
-👥 *Holders:* ${tokenInfo?.holder || "N/A"}
+💰 *Price:* $${details?.priceUSD?.toFixed(6) || "N/A"}
+📈 *Market Cap:* $${details?.marketCapUSD?.toLocaleString() || "N/A"}
+👥 *Holders:* ${details?.holders || "N/A"}
 🔗 [View on Birdeye](https://birdeye.so/token/${token.address}?chain=solana)
-        `;
+      `;
 
-        await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
-      }
+      await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
     }
-  } catch (e) {
-    console.error("LP burn lekérés hiba:", e.message);
   }
 }
 
-// 10 mp-enként frissítünk
+// 10 másodpercenként futtatjuk
 setInterval(fetchBurnEvents, 10000);
