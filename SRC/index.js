@@ -1,83 +1,66 @@
+import express from "express";
+import bodyParser from "body-parser";
 import fetch from "node-fetch";
-import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
+import TelegramBot from "node-telegram-bot-api";
+
 dotenv.config();
 
-const bot = new TelegramBot(process.env.BOT_TOKEN);
-const channelId = process.env.CHANNEL_ID;
-const HELIUS_URL = `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`;
+const app = express();
+app.use(bodyParser.json());
 
-// Solana "burn" címek
-const BURN_ADDRESSES = [
-  "11111111111111111111111111111111",
-  "Sysvar1111111111111111111111111111111111111"
-];
+const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN;
+const TELEGRAM_CHANNEL_ID = process.env.CHANNEL_ID;
+const HELIUS_RPC = process.env.HELIUS_RPC_URL;
 
-// Debug funkció → utolsó 20 tranzakció SPL burn ellenőrzés
-async function checkRecentBurns() {
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
+
+app.post("/webhook", async (req, res) => {
   try {
-    const response = await fetch(HELIUS_URL, {
+    const data = req.body;
+    if (!data || !data[0]) return res.sendStatus(200);
+
+    const tx = data[0];
+    if (tx.type !== "BURN") return res.sendStatus(200);
+
+    const tokenMint = tx.tokenTransfers?.[0]?.mint;
+    const amountBurned = tx.tokenTransfers?.[0]?.tokenAmount || 0;
+    const owner = tx.tokenTransfers?.[0]?.fromUserAccount;
+
+    // Lekérdezzük az aktuális LP egyenleget
+    const balanceResponse = await fetch(HELIUS_RPC, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         jsonrpc: "2.0",
-        id: "helius-debug",
-        method: "getSignaturesForAddress",
-        params: ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", { limit: 20 }]
-      })
+        id: 1,
+        method: "getTokenSupply",
+        params: [tokenMint]
+      }),
     });
 
-    const data = await response.json();
+    const balanceData = await balanceResponse.json();
+    const remaining = balanceData?.result?.value?.uiAmount || 0;
 
-    if (!data.result || data.result.length === 0) {
-      await bot.sendMessage(channelId, "⚠️ Nincs új tranzakció a Helius RPC-n keresztül.");
-      return;
+    // Csak akkor posztolunk, ha a teljes LP elégett
+    if (remaining === 0) {
+      const msg = `🔥 **LP BURN ÉSZLELVE** 🔥
+      
+Token: \`${tokenMint}\`
+Elégetett mennyiség: ${amountBurned}
+Burn cím: ${owner}
+Tx: https://solscan.io/tx/${tx.signature}`;
+
+      await bot.sendMessage(TELEGRAM_CHANNEL_ID, msg, { parse_mode: "Markdown" });
     }
 
-    for (const tx of data.result) {
-      const sig = tx.signature;
-
-      // Lekérdezzük a részleteket
-      const detailsResponse = await fetch(HELIUS_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: "helius-debug",
-          method: "getTransaction",
-          params: [sig, { encoding: "jsonParsed" }]
-        })
-      });
-
-      const details = await detailsResponse.json();
-
-      if (details.result?.transaction?.message?.instructions) {
-        const instructions = details.result.transaction.message.instructions;
-
-        for (const ix of instructions) {
-          // Ellenőrizzük, hogy a cím burn-e
-          if (BURN_ADDRESSES.includes(ix.parsed?.info?.destination)) {
-            const amount = ix.parsed?.info?.amount || "N/A";
-            const mint = ix.parsed?.info?.mint || "Unknown";
-
-            await bot.sendMessage(
-              channelId,
-              `🔥 **LP Burn esemény** 🔥\n\n` +
-              `Token: ${mint}\n` +
-              `Mennyiség: ${amount}\n` +
-              `Tx: https://solscan.io/tx/${sig}`
-            );
-          }
-        }
-      }
-    }
+    res.sendStatus(200);
   } catch (err) {
-    console.error(err);
-    await bot.sendMessage(channelId, "❌ Hiba a Helius lekérdezés során!");
+    console.error("Webhook hiba:", err);
+    res.sendStatus(500);
   }
-}
+});
 
-// 30 másodpercenként ellenőrizzük
-setInterval(checkRecentBurns, 30000);
-
-bot.sendMessage(channelId, "🤖 Bot elindult, debug mód bekapcsolva!");
+app.listen(10000, () => {
+  console.log("🚀 Webhook szerver fut a 10000-es porton");
+});
