@@ -5,79 +5,82 @@ dotenv.config();
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
 const CHANNEL_ID = process.env.CHANNEL_ID;
-const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
-const BIRDEYE_GRAPHQL = "https://public-api.birdeye.so/graphql";
+const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
 
-// GraphQL hívás segédfüggvény
-async function birdeyeQuery(query, variables = {}) {
+const BITQUERY_URL = "https://graphql.bitquery.io";
+
+const LP_POOLS = [
+  "So11111111111111111111111111111111111111112", // Példa Solana USDC LP pool
+  "Ray111111111111111111111111111111111111111" // Példa Raydium LP pool
+];
+
+async function fetchLPBurns(poolAddress) {
+  const query = `
+    query {
+      solana(network: solana) {
+        transfers(
+          options: {desc: "block.timestamp.time", limit: 20}
+          transferType: burn
+          sender: {is: "${poolAddress}"}
+        ) {
+          block {
+            timestamp {
+              time(format: "%Y-%m-%d %H:%M:%S")
+            }
+          }
+          currency {
+            address
+            symbol
+            name
+          }
+          amount
+          receiver {
+            address
+          }
+          transaction {
+            signature
+          }
+        }
+      }
+    }
+  `;
+
   try {
     const res = await axios.post(
-      BIRDEYE_GRAPHQL,
-      { query, variables },
+      BITQUERY_URL,
+      { query },
       {
         headers: {
           "Content-Type": "application/json",
-          "x-api-key": BIRDEYE_API_KEY,
+          "X-API-KEY": BITQUERY_API_KEY,
         },
-        timeout: 8000,
       }
     );
-    return res.data.data;
-  } catch (err) {
-    console.error("Birdeye API hiba:", err.message);
-    return null;
+
+    return res.data.data.solana.transfers || [];
+  } catch (e) {
+    console.error("Bitquery API hiba:", e.message);
+    return [];
   }
 }
 
-// Token list lekérdezés (top 100 token marketcap szerint)
-async function fetchTokenList() {
-  const query = `
-    query {
-      tokens(chain: "solana", sort: MARKETCAP, limit: 100, order: DESC) {
-        address
-        symbol
-        name
-        liquidityUSD
-      }
-    }
-  `;
-  const data = await birdeyeQuery(query);
-  return data?.tokens || [];
-}
-
-// Token részletes adatok lekérdezése
-async function fetchTokenDetails(address) {
-  const query = `
-    query ($address: String!) {
-      token(chain: "solana", address: $address) {
-        priceUSD
-        marketCapUSD
-        holders
-      }
-    }
-  `;
-  const data = await birdeyeQuery(query, { address });
-  return data?.token || {};
-}
-
-// Fő LP-burn figyelő függvény
-async function fetchBurnEvents() {
+async function checkBurnEvents() {
   console.log("🔄 Ellenőrzés indul...");
 
-  const tokens = await fetchTokenList();
-  for (const token of tokens) {
-    if (token.liquidityUSD === 0) {
-      const details = await fetchTokenDetails(token.address);
+  for (const pool of LP_POOLS) {
+    const burns = await fetchLPBurns(pool);
 
+    for (const burn of burns) {
       const msg = `
-🔥 *100% LP Burn Detected!* 🔥
+🔥 *LP Token Burn Detected!* 🔥
 
-💎 *Token:* ${token.name} (${token.symbol})
-📜 *Contract:* \`${token.address}\`
-💰 *Price:* $${details.priceUSD?.toFixed(6) || "N/A"}
-📈 *Market Cap:* $${details.marketCapUSD?.toLocaleString() || "N/A"}
-👥 *Holders:* ${details.holders || "N/A"}
-🔗 [View on Birdeye](https://birdeye.so/token/${token.address}?chain=solana)
+💎 *Token:* ${burn.currency.name} (${burn.currency.symbol})
+📜 *Contract:* \`${burn.currency.address}\`
+📤 *Sender (Pool):* \`${pool}\`
+📥 *Burn Address:* \`${burn.receiver.address}\`
+💰 *Amount:* ${burn.amount}
+⏰ *Time:* ${burn.block.timestamp.time}
+🔗 [Tx on Solscan](https://solscan.io/tx/${burn.transaction.signature})
       `;
 
       await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
@@ -85,5 +88,5 @@ async function fetchBurnEvents() {
   }
 }
 
-// 10 másodpercenként fut a lekérdezés
-setInterval(fetchBurnEvents, 10000);
+// 10 másodpercenként ellenőrzi
+setInterval(checkBurnEvents, 10000);
