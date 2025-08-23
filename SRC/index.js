@@ -65,6 +65,9 @@ const PRICE_TTL_MS = 180000;
 const priceCache = new Map();
 const solUsdCache = { price: null, ts: 0 };
 
+// --- DexScreener cache (kevesebb 429) ---
+const DS_TTL_MS = 120000;      // 2 perc
+const dsCache   = new Map();   // mint -> { data, ts }
 setInterval(()=>console.log("[HEARTBEAT]", new Date().toISOString()), 15000);
 
 /* ===== Helpers ===== */
@@ -92,32 +95,38 @@ function isJsonLike(res){
   const ct = (res.headers.get("content-type")||"").toLowerCase();
   return ct.includes("application/json");
 }
-async function fetchJSONWithBackoff(url, opts={}, maxRetries=5, baseDelayMs=500){
-  let delay=baseDelayMs;
-  for (let i=0;i<=maxRetries;i++){
-    try{
+async function fetchJSONWithBackoff(url, opts={}, maxRetries=5, baseDelayMs=500, label="http") {
+  let delay = baseDelayMs;
+  for (let i = 0; i <= maxRetries; i++) {
+    try {
       const res = await fetch(url, opts);
-      if (res.status===429||res.status===503){
-        const ra=Number(res.headers.get("retry-after"))||0;
-        const wait=Math.max(delay,ra*1000);
-        console.warn("[backoff]",res.status,"retry in",wait,"ms");
-        await new Promise(r=>setTimeout(r,wait));
-        delay*=2; continue;
+
+      if (res.status === 429 || res.status === 503) {
+        const ra = Number(res.headers.get("retry-after")) || 0;
+        const wait = Math.max(delay, ra * 1000);
+        console.warn(`[backoff ${label}]`, res.status, "retry in", wait, "ms");
+        await new Promise(r => setTimeout(r, wait));
+        delay *= 2;
+        continue;
       }
-      if (!isJsonLike(res)){
-        await res.text().catch(()=>{});
-        console.warn("[backoff] non-JSON retry in",delay,"ms");
-        await new Promise(r=>setTimeout(r,delay));
-        delay*=2; continue;
+
+      if (!isJsonLike(res)) {
+        await res.text().catch(() => {});
+        console.warn(`[backoff ${label}] non-JSON retry in`, delay);
+        await new Promise(r => setTimeout(r, delay));
+        delay *= 2;
+        continue;
       }
-      const j=await res.json();
-      if (!res.ok) throw new Error("HTTP "+res.status+": "+JSON.stringify(j).slice(0,180));
+
+      const j = await res.json();
+      if (!res.ok) throw new Error("HTTP " + res.status);
       return j;
-    }catch(e){
-      if (i===maxRetries) throw e;
-      console.warn("[backoff] err:",e.message||e,"retry in",delay,"ms");
-      await new Promise(r=>setTimeout(r,delay));
-      delay*=2;
+
+    } catch (e) {
+      if (i === maxRetries) throw e;
+      console.warn(`[backoff ${label}] err:`, e.message || e, "retry in", delay);
+      await new Promise(r => setTimeout(r, delay));
+      delay *= 2;
     }
   }
   throw new Error("unreachable");
@@ -199,23 +208,38 @@ async function getSolUsd(){
 
 /* ===== DexScreener ===== */
 async function enrichDexScreener(mint){
+  const now = Date.now();
+  const cached = dsCache.get(mint);
+  if (cached && (now - cached.ts) < DS_TTL_MS) return cached.data;
+
   try{
-    const j=await fetchJSONWithBackoff(
-      "https://api.dexscreener.com/latest/dex/tokens/"+mint,
-      {headers:{"User-Agent":"BurnBot/1.0","Accept":"application/json"}},3,400);
-    const pairs=j?.pairs||[];
-    const sols=pairs.filter(p=>(p?.chainId||"").toLowerCase()==="solana");
-    const arr=(sols.length?sols:pairs).sort((a,b)=>(b?.liquidity?.usd||0)-(a?.liquidity?.usd||0));
-    const best=arr[0]; if (!best) return null;
-    return {
-      priceUsd:Number(best.priceUsd)||null,
-      liqUsd:Number(best.liquidity?.usd)||null,
-      fdv:Number(best.fdv)||null,
-      ratio:(best.fdv && best.liquidity?.usd)?best.fdv/best.liquidity.usd:null,
-      createdMs:best.pairCreatedAt?Number(best.pairCreatedAt):null,
-      url:best.url||("https://dexscreener.com/solana/"+mint)
+    const j = await fetchJSONWithBackoff(
+      "https://api.dexscreener.com/latest/dex/tokens/"+encodeURIComponent(mint),
+      { headers:{ "User-Agent":"BurnBot/1.0", "Accept":"application/json" } },
+      3, 400, "dexscreener"
+    );
+    const pairs = j?.pairs || [];
+    const sols  = pairs.filter(p => (p?.chainId||"").toLowerCase()==="solana");
+    const arr   = (sols.length?sols:pairs).slice()
+                   .sort((a,b)=>(b?.liquidity?.usd||0)-(a?.liquidity?.usd||0));
+    const best  = arr[0];
+    if (!best) { dsCache.set(mint, { data: null, ts: now }); return null; }
+
+    const data = {
+      priceUsd:  Number(best.priceUsd) || null,
+      liqUsd:    Number(best.liquidity?.usd) || null,
+      fdv:       Number(best.fdv) || null,
+      ratio:     (best.fdv && best.liquidity?.usd) ? best.fdv / best.liquidity.usd : null,
+      createdMs: best.pairCreatedAt ? Number(best.pairCreatedAt) : null,
+      url:       best.url || ("https://dexscreener.com/solana/"+mint)
     };
-  }catch(e){ console.warn("DexScreener fail:",e.message); return null; }
+    dsCache.set(mint, { data, ts: now });
+    return data;
+  }catch(e){
+    console.warn("DexScreener enrich fail:", e?.message || e);
+    dsCache.set(mint, { data: null, ts: now }); // ideiglenesen cache-eljük a „nincs adat”-ot is
+    return null;
+  }
 }
 
 /* ===== RPC stats ===== */
@@ -258,38 +282,62 @@ function renderTop(top10,pct,supplyUi){
 
 /* ===== Post ===== */
 async function postReport(burn){
-  const solUsd=await getSolUsd();
-  const tokenUsd=burn.mint?await getUsdPriceByMint(burn.mint):null;
-  let burnSol=null;
-  if(burn.amount && tokenUsd && solUsd) burnSol=(burn.amount*tokenUsd)/solUsd;
-  if(cfg.minSol>0){
-    if(burnSol==null || burnSol<cfg.minSol){ console.log("[SKIP < MIN_SOL]",short(burn.sig)); return false; }
+  // Előbb LP (DexScreener)
+  const ds = burn.mint ? await enrichDexScreener(burn.mint) : null;
+
+  if (lpStrict) {
+    if (!(ds && ds.liqUsd === 0)) {
+      console.log("[SKIP LP not fully burned]", short(burn.sig), "liqUsd=", ds ? ds.liqUsd : "n/a");
+      return false;
+    }
+  } else {
+    if (ds && typeof ds.liqUsd === "number" && ds.liqUsd > 0) {
+      console.log("[SKIP LP>0 relaxed]", short(burn.sig), "liqUsd=", ds.liqUsd);
+      return false;
+    }
   }
-  const ds=burn.mint?await enrichDexScreener(burn.mint):null;
-  if(lpStrict){
-    if(!(ds && ds.liqUsd===0)){ console.log("[SKIP LP not fully burned]",short(burn.sig)); return false; }
-  }else{
-    if(ds && typeof ds.liqUsd==="number" && ds.liqUsd>0){ console.log("[SKIP LP>0 relaxed]",short(burn.sig)); return false; }
+
+  // Csak most kérünk árat
+  const solUsd   = await getSolUsd();
+  const tokenUsd = burn.mint ? await getUsdPriceByMint(burn.mint) : null;
+
+  let burnSol = null;
+  if (burn.amount && tokenUsd && solUsd) burnSol = (burn.amount * tokenUsd) / solUsd;
+
+  if (cfg.minSol > 0 && (!burnSol || burnSol < cfg.minSol)) {
+    console.log("[SKIP < MIN_SOL="+cfg.minSol+"]", short(burn.sig), "burnSol=", burnSol);
+    return false;
   }
-  let mcapSol=null;
-  if(ds?.fdv && solUsd) mcapSol=ds.fdv/solUsd;
-  if(cfg.maxMcapSol>0 && mcapSol>cfg.maxMcapSol){ console.log("[SKIP mcap]",short(burn.sig)); return false; }
-  const stats=burn.mint?await rpcStats(burn.mint):{};
-  const lines=[];
-  lines.push("Token: "+(burn.mint||"n/a"));
-  lines.push("Marketcap: "+(mcapSol!=null?fmtSol(mcapSol,2):"n/a"));
-  lines.push("Liquidity: "+(ds?.liqUsd===0?"0 (LP burned)":"has LP"));
-  lines.push("Price: "+(tokenUsd&&solUsd?fmtSol(tokenUsd/solUsd,6):"n/a"));
-  lines.push("Burned Amount: "+fmtNum(burn.amount,4)+" (~"+(burnSol?fmtSol(burnSol,4):"n/a")+")");
-  lines.push("Total Supply: "+fmtNum(stats.supplyUi,0));
-  lines.push("Security:\n"+renderSecurity(stats.mintRenounced,stats.freezeRenounced));
-  lines.push("Top Holders:\n"+renderTop(stats.top10,stats.top10Pct,stats.supplyUi));
-  lines.push(links(burn.sig,burn.mint,ds?.url));
-  const text=lines.join("\n");
-  await bot.telegram.sendMessage(CHANNEL_ID,text,{disable_web_page_preview:true});
-  console.log("[POSTED]",short(burn.sig));
-  return true;
-}
+
+  let mcapSol = null;
+  if (ds?.fdv && solUsd) mcapSol = ds.fdv / solUsd;
+  if (cfg.maxMcapSol > 0 && mcapSol != null && mcapSol > cfg.maxMcapSol) {
+    console.log("[SKIP mcap > MAX_MCAP_SOL]", short(burn.sig), "mcapSol=", mcapSol);
+    return false;
+  }
+
+  // … a függvény többi része mehet tovább változatlan …
+
+  // Csak most kérünk árat
+  const solUsd   = await getSolUsd();
+  const tokenUsd = burn.mint ? await getUsdPriceByMint(burn.mint) : null;
+
+  let burnSol = null;
+  if (burn.amount && tokenUsd && solUsd) burnSol = (burn.amount * tokenUsd) / solUsd;
+
+  if (cfg.minSol > 0 && (!burnSol || burnSol < cfg.minSol)) {
+    console.log("[SKIP < MIN_SOL="+cfg.minSol+"]", short(burn.sig), "burnSol=", burnSol);
+    return false;
+  }
+
+  let mcapSol = null;
+  if (ds?.fdv && solUsd) mcapSol = ds.fdv / solUsd;
+  if (cfg.maxMcapSol > 0 && mcapSol != null && mcapSol > cfg.maxMcapSol) {
+    console.log("[SKIP mcap > MAX_MCAP_SOL]", short(burn.sig), "mcapSol=", mcapSol);
+    return false;
+  }
+
+  // … a függvény többi része mehet tovább változatlan …
 
 /* ===== Polling ===== */
 async function pollOnce(){
