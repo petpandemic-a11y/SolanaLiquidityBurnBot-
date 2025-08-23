@@ -51,10 +51,10 @@ let pollTimer = null;
 const seen = new Map(); // key: sig::mint → ts
 
 // caches
-const PRICE_TTL_MS = 60 * 1000;
+const PRICE_TTL_MS = 60000;
 const priceCache = new Map(); // mint -> { usdPrice, ts }
 const solUsdCache = { price: null, ts: 0 };
-const MAX_PRICE_LOOKUPS_PER_POLL = 6;
+const MAX_PRICE_LOOKUPS_PER_POLL = 2;
 
 setInterval(function(){ console.log("[HEARTBEAT]", new Date().toISOString()); }, 15000);
 
