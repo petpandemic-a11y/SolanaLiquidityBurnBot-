@@ -10,8 +10,8 @@ const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
 const BITQUERY_URL = "https://graphql.bitquery.io";
 
 const LP_POOLS = [
-  "So11111111111111111111111111111111111111112", // Példa Solana USDC LP pool
-  "Ray111111111111111111111111111111111111111" // Példa Raydium LP pool
+  "So11111111111111111111111111111111111111112", // Solana USDC LP pool
+  "Ray111111111111111111111111111111111111111"  // Raydium LP pool
 ];
 
 async function fetchLPBurns(poolAddress) {
@@ -52,14 +52,14 @@ async function fetchLPBurns(poolAddress) {
       {
         headers: {
           "Content-Type": "application/json",
-          "X-API-KEY": BITQUERY_API_KEY,
+          "Authorization": `Bearer ${BITQUERY_API_KEY}`
         },
       }
     );
 
     return res.data.data.solana.transfers || [];
   } catch (e) {
-    console.error("Bitquery API hiba:", e.message);
+    console.error("Bitquery API hiba:", e.response?.status, e.response?.data || e.message);
     return [];
   }
 }
@@ -88,5 +88,4 @@ async function checkBurnEvents() {
   }
 }
 
-// 10 másodpercenként ellenőrzi
 setInterval(checkBurnEvents, 10000);
