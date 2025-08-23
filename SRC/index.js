@@ -1,4 +1,4 @@
-// SRC/index.js — ULTRA bot (Bitquery v2 EAP, TokenSupplyUpdates) + abs(amount) + decimals fix + DexScreener + RPC + /post + /debug + /setmin + /status
+// SRC/index.js — ULTRA bot (Bitquery v2 EAP) + DexScreener/Jupiter ár fallback + RPC + /post + /debug + /setmin + /status
 import 'dotenv/config';
 import fetch from 'node-fetch';
 import { Telegraf } from 'telegraf';
@@ -7,24 +7,13 @@ import { getMint } from '@solana/spl-token';
 
 /**
  * ENV:
- *  BOT_TOKEN              Telegram bot token
- *  CHANNEL_ID             Csatorna/chat ID (pl. -1002778911061 VAGY @handle)
- *  BITQUERY_API_KEY       Bitquery API v2 Access Token (ory_at_…)
- *  MIN_USD                Min. USD küszöb (string is ok), default "30"
- *  POLL_INTERVAL_SEC      Poll periódus sec, default "10"
- *  POLL_LOOKBACK_SEC      Időablak sec, default "12"
- *  DEDUP_MINUTES          Deduplikációs ablak perc, default "10"
- *  RPC_URL                Opcionális custom Solana RPC
+ *  BOT_TOKEN, CHANNEL_ID, BITQUERY_API_KEY (ory_at_…)
+ *  MIN_USD ("30"), POLL_INTERVAL_SEC ("10"), POLL_LOOKBACK_SEC ("12"), DEDUP_MINUTES ("10")
+ *  RPC_URL (opcionális)
  */
-
 const {
-  BOT_TOKEN,
-  CHANNEL_ID,
-  BITQUERY_API_KEY,
-  MIN_USD = '30',
-  POLL_INTERVAL_SEC = '10',
-  POLL_LOOKBACK_SEC = '12',
-  DEDUP_MINUTES = '10',
+  BOT_TOKEN, CHANNEL_ID, BITQUERY_API_KEY,
+  MIN_USD = '30', POLL_INTERVAL_SEC = '10', POLL_LOOKBACK_SEC = '12', DEDUP_MINUTES = '10',
   RPC_URL
 } = process.env;
 
@@ -35,7 +24,7 @@ if (!BITQUERY_API_KEY) throw new Error('Missing BITQUERY_API_KEY');
 const bot = new Telegraf(BOT_TOKEN);
 const connection = new Connection(RPC_URL || clusterApiUrl('mainnet-beta'), 'confirmed');
 
-// -------------------- State (futás közbeni állíthatóság) --------------------
+// ---- futás közbeni config ----
 let cfg = {
   minUsd: Number(MIN_USD) || 30,
   pollIntervalSec: Number(POLL_INTERVAL_SEC) || 10,
@@ -44,16 +33,15 @@ let cfg = {
 };
 let pollTimer = null;
 
-// -------------------- Helpers & utils --------------------
-const mask = s => (s ? s.slice(0,4)+'…'+s.slice(-4) : 'n/a');
-console.log('[ENV] BITQUERY_API_KEY =', mask(BITQUERY_API_KEY));
-
+// ---- utils ----
 const seen = new Map(); // key(sig+mint) -> ts
+const mask = s => (s ? s.slice(0,4)+'…'+s.slice(-4) : 'n/a');
 const short = s => (s && s.length > 12 ? s.slice(0,4)+'…'+s.slice(-4) : s);
 const fmtUsd = (x, frac=2) => (x==null ? 'n/a' : '$'+Number(x).toLocaleString(undefined,{maximumFractionDigits:frac}));
 const fmtPct = x => (x==null ? 'n/a' : (Number(x)*100).toFixed(2)+'%');
 const fmtNum = (x, frac=0) => (x==null ? 'n/a' : Number(x).toLocaleString(undefined,{maximumFractionDigits:frac}));
 const nowMs = () => Date.now();
+const keyFor = (sig, mint) => `${sig || 'no-sig'}::${mint || 'no-mint'}`;
 
 function minutesAgo(tsMs){
   if (!tsMs) return 'n/a';
@@ -62,32 +50,48 @@ function minutesAgo(tsMs){
   if (m === 1) return '1 minute ago';
   return `${m} minutes ago`;
 }
-
-function pruneSeen() {
+function pruneSeen(){
   const dedupMs = cfg.dedupMinutes * 60 * 1000;
   const t = nowMs();
   for (const [k,ts] of Array.from(seen.entries())) if (t - ts > dedupMs) seen.delete(k);
 }
+console.log('[ENV] BITQUERY_API_KEY =', mask(BITQUERY_API_KEY));
+console.log('[CFG]', cfg);
 
-const keyFor = (sig, mint) => `${sig || 'no-sig'}::${mint || 'no-mint'}`;
-
-// -------------------- Price (Jupiter fallback) --------------------
-const priceCache = new Map(); // mint -> { price, ts }
+// ---- árak (Jupiter + DexScreener fallback) ----
+const priceCache = new Map(); // mint -> { price, ts, source }
 const PRICE_TTL_MS = 60_000;
+
+async function priceFromJupiter(mint){
+  const r = await fetch(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`);
+  const j = await r.json();
+  const p = j?.data?.[mint]?.price ?? null;
+  return (p!=null && Number.isFinite(Number(p))) ? Number(p) : null;
+}
+async function priceFromDexScreener(mint){
+  const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(mint)}`);
+  const j = await r.json();
+  const pairs = j?.pairs || [];
+  const sols = pairs.filter(p => (p?.chainId||'').toLowerCase()==='solana');
+  const best = (sols.length?sols:pairs).sort((a,b)=>(b?.liquidity?.usd||0)-(a?.liquidity?.usd||0))[0];
+  const p = best?.priceUsd;
+  return (p!=null && Number.isFinite(Number(p))) ? Number(p) : null;
+}
 async function getUsdPriceByMint(mint){
-  const t = nowMs();
+  const t = Date.now();
   const cached = priceCache.get(mint);
-  if (cached && t - cached.ts < PRICE_TTL_MS) return cached.price;
-  try{
-    const r = await fetch(`https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`);
-    const j = await r.json();
-    const p = j?.data?.[mint]?.price ?? null;
-    if (p){ priceCache.set(mint,{price:p,ts:t}); return p; }
-  }catch(e){ console.error('Jupiter price error:', e?.message); }
-  return null;
+  if (cached && (t - cached.ts) < PRICE_TTL_MS) return cached.price;
+
+  let price = null; let src='none';
+  try { price = await priceFromJupiter(mint); src='jup'; } catch {}
+  if (price==null){
+    try { price = await priceFromDexScreener(mint); src='ds'; } catch {}
+  }
+  if (price!=null) priceCache.set(mint, { price, ts:t, source:src });
+  return price;
 }
 
-// -------------------- Bitquery (V2 EAP) --------------------
+// ---- Bitquery (V2 EAP) ----
 const GQL = (sec) => `
 query BurnsLastWindow {
   Solana(dataset: realtime, network: solana) {
@@ -102,25 +106,18 @@ query BurnsLastWindow {
     ) {
       Block { Time }
       Transaction { Signature }
-      Instruction { Program { Method Name Address } }
       TokenSupplyUpdate {
         Amount
         AmountInUSD
-        PreBalance
-        PostBalance
-        Currency { MintAddress Name Symbol Decimals }
+        Currency { MintAddress Symbol Decimals }
       }
     }
   }
 }`;
-
 async function bitqueryFetch(query){
   const res = await fetch('https://streaming.bitquery.io/eap', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${BITQUERY_API_KEY}`,
-    },
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${BITQUERY_API_KEY}` },
     body: JSON.stringify({ query })
   });
   const text = await res.text();
@@ -131,13 +128,8 @@ async function bitqueryFetch(query){
   return json;
 }
 
-const numOrNull = v => {
-  if (v==null) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-};
-
-// TokenSupplyUpdates → burn objektumok (abs, decimals -> uiAmount)
+// ---- parse (abs, decimals→UI) ----
+const numOrNull = v => { if (v==null) return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
 function parseBurnNodes(nodes){
   const out = [];
   for (const n of nodes){
@@ -145,36 +137,55 @@ function parseBurnNodes(nodes){
     const timeIso = n?.Block?.Time || null;
     const tu = n?.TokenSupplyUpdate || null;
     const mint = tu?.Currency?.MintAddress || null;
-
     const decimals = numOrNull(tu?.Currency?.Decimals) ?? 0;
 
-    // Bitquery Amount: előjeles delta. Burn → negatív. Vegyük abszolútot.
-    const rawAmt = numOrNull(tu?.Amount);
-    const rawUsd = numOrNull(tu?.AmountInUSD);
-
+    const rawAmt = numOrNull(tu?.Amount);     // burn → negatív
     const absRawAmt = rawAmt!=null ? Math.abs(rawAmt) : null;
+    const rawUsd = numOrNull(tu?.AmountInUSD);
+    const absUsd = rawUsd!=null ? Math.abs(rawUsd) : null;
 
-    // Ha integer jellegű szám és van decimals, konvertáljuk UI mennyiségre
-    // (Bitquery sokszor már UI-ban adja, de safe: ha nagyon nagy integer és decimals>0, osszuk le)
+    // ha nagyon nagy egész és van decimals, skálázzuk UI-ra
     let amountUi = absRawAmt;
     if (absRawAmt!=null && decimals>0) {
-      // heuristics: ha absRawAmt egész és nagy, skálázzuk
       const isInt = Number.isInteger(absRawAmt);
-      if (isInt && absRawAmt > 10 ** (decimals - 2)) {
-        amountUi = absRawAmt / (10 ** decimals);
-      }
+      if (isInt && absRawAmt > 10 ** Math.max(0, decimals - 2)) amountUi = absRawAmt / (10 ** decimals);
     }
 
-    out.push({
-      sig, timeIso, mint,
-      amount: amountUi,             // UI amount (abs)
-      amountUsd: rawUsd!=null ? Math.abs(rawUsd) : null // USD abs
-    });
+    out.push({ sig, timeIso, mint, amount: amountUi, amountUsd: absUsd });
   }
   return out;
 }
 
-// -------------------- DexScreener enrich --------------------
+// ---- RPC statok ----
+async function rpcStats(mintStr){
+  const mintPk = new PublicKey(mintStr);
+  let supplyUi=null, top10=[], top10Pct=null, mintRenounced=null, freezeRenounced=null;
+
+  try{
+    const s = await connection.getTokenSupply(mintPk);
+    supplyUi = s?.value?.uiAmount ?? null;
+  }catch(e){}
+
+  try{
+    const largest = await connection.getTokenLargestAccounts(mintPk);
+    const arr = largest?.value || [];
+    top10 = arr.slice(0,10).map(v => ({ address: v.address.toBase58(), amount: v.uiAmount }));
+    if (supplyUi && supplyUi > 0){
+      const sum = top10.reduce((a,c)=>a+(Number(c.amount)||0),0);
+      top10Pct = sum / supplyUi;
+    }
+  }catch(e){}
+
+  try{
+    const mi = await getMint(connection, mintPk);
+    mintRenounced = (mi?.mintAuthority === null);
+    freezeRenounced = (mi?.freezeAuthority === null);
+  }catch(e){}
+
+  return { supplyUi, top10, top10Pct, mintRenounced, freezeRenounced };
+}
+
+// ---- DexScreener enrich (árat innen is használjuk USD-hez fallbackként) ----
 async function enrichDexScreener(mint){
   try{
     const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(mint)}`);
@@ -198,45 +209,12 @@ async function enrichDexScreener(mint){
     const tg = socials.find(s => (s?.type||'').toLowerCase()==='telegram')?.url || null;
     const tw = socials.find(s => ['twitter','x'].includes((s?.type||'').toLowerCase()))?.url || null;
 
-    const url = best?.url || null; // DexScreener pair URL
-
+    const url = best?.url || null;
     return { priceUsd, liqUsd, fdv, ratio, createdMs, site, tg, tw, url };
-  }catch(e){
-    console.error('DexScreener error:', e?.message);
-    return null;
-  }
+  }catch(e){ return null; }
 }
 
-// -------------------- RPC: supply, top10, authorities --------------------
-async function rpcStats(mintStr){
-  const mintPk = new PublicKey(mintStr);
-  let supplyUi=null, top10=[], top10Pct=null, mintRenounced=null, freezeRenounced=null;
-
-  try{
-    const s = await connection.getTokenSupply(mintPk);
-    supplyUi = s?.value?.uiAmount ?? null;
-  }catch(e){ console.error('getTokenSupply error:', e?.message); }
-
-  try{
-    const largest = await connection.getTokenLargestAccounts(mintPk);
-    const arr = largest?.value || [];
-    top10 = arr.slice(0,10).map(v => ({ address: v.address.toBase58(), amount: v.uiAmount }));
-    if (supplyUi && supplyUi > 0){
-      const sum = top10.reduce((a,c)=>a+(Number(c.amount)||0),0);
-      top10Pct = sum / supplyUi;
-    }
-  }catch(e){ console.error('getTokenLargestAccounts error:', e?.message); }
-
-  try{
-    const mi = await getMint(connection, mintPk);
-    mintRenounced = (mi?.mintAuthority === null);
-    freezeRenounced = (mi?.freezeAuthority === null);
-  }catch(e){ console.error('getMint error:', e?.message); }
-
-  return { supplyUi, top10, top10Pct, mintRenounced, freezeRenounced };
-}
-
-// -------------------- Formatting --------------------
+// ---- formatting ----
 function links(sig, mint, dsUrl){
   const out=[];
   if (sig) out.push(`[Solscan](https://solscan.io/tx/${sig})`);
@@ -259,19 +237,18 @@ function renderSecurity(mintRenounced, freezeRenounced){
   return `${meta}\n${mint}\n${frz}`;
 }
 
-// -------------------- Telegram posting --------------------
+// ---- posztolás ----
 async function postReport(burn){
-  // USD threshold (abs)
+  // USD számítás: Bitquery (abs) → Jupiter → DexScreener
   let usd = (typeof burn.amountUsd==='number' && burn.amountUsd>0) ? burn.amountUsd : null;
 
-  // ha nincs USD az API-tól: price * amountUi
   if ((usd==null || usd===0) && burn.mint && typeof burn.amount==='number' && burn.amount>0){
-    const px = await getUsdPriceByMint(burn.mint);
+    const px = await getUsdPriceByMint(burn.mint); // jup→ds fallback
     if (px) usd = burn.amount * px;
   }
 
   if (cfg.minUsd>0 && (usd==null || usd < cfg.minUsd)){
-    console.log(`[SKIP<$${cfg.minUsd}] ${burn.sig} mint=${short(burn.mint)} amount=${burn.amount} usd=${usd}`);
+    console.log(`[SKIP<$${cfg.minUsd}] sig=${short(burn.sig)} mint=${short(burn.mint)} amount=${burn.amount} usd=${usd}`);
     return false;
   }
 
@@ -308,21 +285,18 @@ async function postReport(burn){
   lines.push(links(burn.sig, burn.mint, ds?.url));
   if (burn.mint) lines.push(`\n${burn.mint}`);
 
-  const text = lines.join('\n');
-  await bot.telegram.sendMessage(CHANNEL_ID, text, { parse_mode:'Markdown', disable_web_page_preview:true });
-  console.log(`[POSTED] ${burn.sig} ~$${usd?.toFixed?.(2)} mint=${short(burn.mint)} amount=${burn.amount}`);
+  await bot.telegram.sendMessage(CHANNEL_ID, lines.join('\n'), { parse_mode:'Markdown', disable_web_page_preview:true });
+  console.log(`[POSTED] sig=${short(burn.sig)} usd≈${usd?usd.toFixed(2):'n/a'} mint=${short(burn.mint)} amount=${burn.amount}`);
   return true;
 }
 
-// -------------------- Polling --------------------
+// ---- polling ----
 async function pollOnce(){
   pruneSeen();
-
   try{
     const json = await bitqueryFetch(GQL(cfg.lookbackSec));
     const nodes = json?.data?.Solana?.TokenSupplyUpdates || [];
     const burns = parseBurnNodes(nodes);
-
     console.log(`[Bitquery] last ${cfg.lookbackSec}s -> nodes=${nodes.length}, parsed=${burns.length}`);
 
     for (const b of burns){
@@ -336,26 +310,61 @@ async function pollOnce(){
     console.error('[Bitquery] fetch error:', e?.message);
   }
 }
+function restartPolling(){ if (pollTimer) clearInterval(pollTimer); pollTimer = setInterval(pollOnce, cfg.pollIntervalSec*1000); }
 
-function restartPolling(){
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(pollOnce, cfg.pollIntervalSec*1000);
-}
-
-// -------------------- Debug helper --------------------
+// ---- debug + parancsok ----
 async function debugFetchBurns(seconds = 60) {
   try {
     const json = await bitqueryFetch(GQL(seconds));
     const nodes = json?.data?.Solana?.TokenSupplyUpdates || [];
     const burns = parseBurnNodes(nodes);
     return { ok:true, nodes: nodes.length, burns: burns.length, preview: burns.slice(0,3) };
-  } catch (e) {
-    return { ok:false, err: e?.message || String(e) };
-  }
+  } catch (e) { return { ok:false, err: e?.message || String(e) }; }
 }
 
-// -------------------- Commands --------------------
 bot.command('ping', (ctx)=>ctx.reply('pong'));
-
 bot.command('post', async (ctx) => {
-  const text = ctx.message.text.split(' ').slice(1).join(' ') || 'Teszt ü
+  const text = ctx.message.text.split(' ').slice(1).join(' ') || 'Teszt üzenet';
+  try { await bot.telegram.sendMessage(process.env.CHANNEL_ID, `🔔 TEST: ${text}`, { disable_web_page_preview: true }); await ctx.reply('✅ Elküldve a csatornába.'); }
+  catch (e) { await ctx.reply(`❌ Nem sikerült: ${e?.description || e?.message}`); }
+});
+bot.command('debug', async (ctx) => {
+  const r = await debugFetchBurns(60);
+  if (!r.ok) return ctx.reply(`❌ Bitquery hiba: ${r.err}`);
+  let msg = `🧪 Debug: last 60s\n• Nodes: ${r.nodes}\n• Parsed burns: ${r.burns}`;
+  if (r.preview?.length) msg += `\n\nMinták:\n` + r.preview.map(b => `- ${b.sig ? b.sig.slice(0,8)+'…' : 'no-sig'} | mint=${b.mint || 'n/a'} | amount=${b.amount ?? 'n/a'} | usd=${b.amountUsd ?? 'n/a'}`).join('\n');
+  return ctx.reply(msg);
+});
+bot.command('setmin', async (ctx) => {
+  const v = Number(ctx.message.text.split(' ')[1]);
+  if (!Number.isFinite(v) || v < 0) return ctx.reply('Használat: /setmin <usd>, pl. /setmin 100');
+  cfg.minUsd = v; ctx.reply(`✅ MIN_USD beállítva: $${v}`);
+});
+bot.command('status', async (ctx) => {
+  const s = [`⚙️ Beállítások:`,`• MIN_USD = $${cfg.minUsd}`,`• POLL_INTERVAL_SEC = ${cfg.pollIntervalSec}s`,`• POLL_LOOKBACK_SEC = ${cfg.lookbackSec}s`,`• DEDUP_MINUTES = ${cfg.dedupMinutes}m`];
+  return ctx.reply(s.join('\n'));
+});
+
+// ---- start ----
+(async ()=>{
+  try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); } catch {}
+  await bot.launch({ dropPendingUpdates: true });
+  console.log('✅ Bot launched (polling).');
+
+  try{
+    await bot.telegram.sendMessage(
+      CHANNEL_ID,
+      `✅ BurnBot elindult.
+• Küszöb: ≥$${cfg.minUsd}
+• Poll: ${cfg.pollIntervalSec}s
+• Window: ${cfg.lookbackSec}s
+• Dedup: ${cfg.dedupMinutes} perc`
+    );
+  }catch(e){ console.error('[startup send] error:', e?.message); }
+
+  await pollOnce();
+  restartPolling();
+})();
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
