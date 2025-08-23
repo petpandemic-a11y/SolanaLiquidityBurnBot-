@@ -6,30 +6,30 @@ dotenv.config();
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
-// DexScreener Solana API
-const DEXSCREENER_API = "https://api.dexscreener.com/latest/dex/tokens/solana";
+// Új, stabil DexScreener Solana végpont
+const DEXSCREENER_API = "https://api.dexscreener.com/latest/dex/pairs/solana";
 
 async function fetchBurnEvents() {
   console.log("🔄 Ellenőrzés indul...");
 
   try {
-    const res = await axios.get(DEXSCREENER_API, { timeout: 10000 });
-    const tokens = res.data?.pairs || [];
+    const res = await axios.get(DEXSCREENER_API, { timeout: 15000 });
+    const pairs = res.data?.pairs || [];
 
-    for (const token of tokens) {
-      const liquidityUSD = token.liquidity?.usd || 0;
+    for (const pair of pairs) {
+      const liquidityUSD = pair.liquidity?.usd || 0;
 
-      // Ha LP = 0 → teljes LP burn
+      // Ha LP likviditás = 0 → teljes LP burn
       if (liquidityUSD === 0) {
         const msg = `
 🔥 *100% LP Burn Detected!* 🔥
 
-💎 *Token:* ${token.baseToken.name} (${token.baseToken.symbol})
-📜 *Contract:* \`${token.baseToken.address}\`
-💰 *Price:* $${token.priceUsd || "N/A"}
-📈 *Market Cap:* $${token.fdv || "N/A"}
-👥 *Liquidity:* $${liquidityUSD}
-🔗 [View on DexScreener](${token.url})
+💎 *Token:* ${pair.baseToken.name} (${pair.baseToken.symbol})
+📜 *Contract:* \`${pair.baseToken.address}\`
+💰 *Price:* $${pair.priceUsd || "N/A"}
+📈 *FDV:* $${pair.fdv || "N/A"}
+💧 *Liquidity:* $${liquidityUSD}
+🔗 [View on DexScreener](${pair.url})
         `;
 
         await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
