@@ -15,13 +15,13 @@ const BIRDEYE_API = "https://public-api.birdeye.so/defi/tokenlist?chain=solana";
 
 // ====== AXIOS BEÁLLÍTÁS ======
 const http = axios.create({
-  timeout: 5000, // 5 másodperc timeout minden API-ra
+  timeout: 8000, // 8 mp timeout, lassú válaszokra is
 });
 
 // ====== LP TOKEN LISTA ======
 let LP_TOKENS = [];
 
-// ====== RAYDIUM LP POOLOK LEKÉRÉSE ======
+// ====== RAYDIUM LP POOLOK ======
 async function fetchRaydiumPools() {
   try {
     const res = await http.get(RAYDIUM_API);
@@ -34,7 +34,7 @@ async function fetchRaydiumPools() {
   }
 }
 
-// ====== JUPITER LP POOLOK LEKÉRÉSE ======
+// ====== JUPITER LP POOLOK ======
 async function fetchJupiterPools() {
   try {
     const res = await http.get(JUPITER_API);
@@ -47,7 +47,7 @@ async function fetchJupiterPools() {
   }
 }
 
-// ====== BIRDEYE FALLBACK LP POOL LISTA ======
+// ====== BIRDEYE FALLBACK ======
 async function fetchBirdeyePools() {
   try {
     const res = await http.get(BIRDEYE_API, {
@@ -65,22 +65,32 @@ async function fetchBirdeyePools() {
   }
 }
 
-// ====== LP POOL LISTA FRISSÍTÉS ======
+// ====== LP POOL LISTA FRISSÍTÉS DIAGNOSZTIKÁVAL ======
 async function updatePools() {
-  console.log("🔹 LP poolok frissítése indul...");
+  console.log("\n🔹 LP poolok frissítése indul...");
   const rayPools = await fetchRaydiumPools();
   const jupPools = await fetchJupiterPools();
 
   let mergedPools = [...rayPools, ...jupPools];
+  let birdeyePools = [];
 
-  if (mergedPools.length < 50) {
+  if (mergedPools.length < 100) {
     console.warn("⚠️ Kevés LP pool, Birdeye fallback indul...");
-    const birdeyePools = await fetchBirdeyePools();
+    birdeyePools = await fetchBirdeyePools();
     mergedPools = [...mergedPools, ...birdeyePools];
   }
 
   LP_TOKENS = [...new Set(mergedPools)];
-  console.log(`ℹ️ LP pool lista frissítve, figyelt poolok száma: ${LP_TOKENS.length}`);
+
+  console.log(`
+📊 **LP pool statisztika**
+────────────────────────────
+🔹 Raydium poolok:  ${rayPools.length}
+🔹 Jupiter poolok:  ${jupPools.length}
+🔹 Birdeye poolok:  ${birdeyePools.length}
+────────────────────────────
+✅ Összes figyelt pool: ${LP_TOKENS.length}
+  `);
 }
 
 // ====== LP BURN LEKÉRÉS BITQUERY-BŐL ======
@@ -120,7 +130,7 @@ async function fetchLPBurns(limit = 30) {
       }
     );
     const transfers = data?.data?.solana?.transfers || [];
-    console.log(`📊 Bitquery lekérdezés sikeres – talált események: ${transfers.length}`);
+    console.log(`📡 Bitquery: ${transfers.length} LP burn esemény`);
     return transfers;
   } catch (err) {
     console.error("❌ Bitquery API hiba:", err.response?.data || err.message);
@@ -162,5 +172,5 @@ async function checkBurnEvents() {
 // ====== BOT INDÍTÁS ======
 console.log("🚀 LP Burn Bot indul...");
 await updatePools();
-setInterval(updatePools, 3600 * 1000);
-setInterval(checkBurnEvents, 10 * 1000);
+setInterval(updatePools, 3600 * 1000); // óránként pool frissítés
+setInterval(checkBurnEvents, 10 * 1000); // 10 mp-enként LP burn ellenőrzés
