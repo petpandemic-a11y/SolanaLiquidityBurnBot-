@@ -1,6 +1,6 @@
 // SRC/index.js — Solana Burn Bot (Bitquery v2 EAP)
-// Design: Solana LP Burns-szerű poszt, USD + SOL érték, Socials + Security + Top Holders
-// Árforrás: Birdeye (ha van key) -> Jupiter -> DexScreener (429/503 backoff + cache)
+// Primary price source: Birdeye (with API key) -> fallback Jupiter -> DexScreener
+// Posts USD and SOL value; layout similar to the example burn channel
 
 import 'dotenv/config';
 import fetch from 'node-fetch';
@@ -14,7 +14,7 @@ const {
   CHANNEL_ID,
   BITQUERY_API_KEY,
   BIRDEYE_API_KEY,
-  PRICE_SOURCE = 'auto',   // 'birdeye' | 'jup' | 'ds' | 'auto'
+  PRICE_SOURCE = 'birdeye',  // 'birdeye' | 'jup' | 'ds' | 'auto'
   MIN_USD = '30',
   POLL_INTERVAL_SEC = '20',
   POLL_LOOKBACK_SEC = '25',
@@ -26,7 +26,7 @@ if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN');
 if (!CHANNEL_ID) throw new Error('Missing CHANNEL_ID');
 if (!BITQUERY_API_KEY) throw new Error('Missing BITQUERY_API_KEY');
 
-const ADMIN_IDS = [1721507540]; // <- a Te ID-d
+const ADMIN_IDS = [1721507540]; // your Telegram user id
 const isAdmin = (ctx) => !!(ctx?.from && ADMIN_IDS.includes(ctx.from.id));
 
 /* ========= Globals ========= */
@@ -43,7 +43,7 @@ let pollTimer = null;
 
 const seen = new Map(); // sig::mint -> ts
 
-// cachek
+// caches
 const PRICE_TTL_MS = 60_000;
 const priceCache = new Map();   // mint -> { price, ts, src }
 const solUsdCache = { price: null, ts: 0 };
@@ -52,7 +52,7 @@ const MAX_PRICE_LOOKUPS_PER_POLL = 6;
 setInterval(()=>console.log('[HEARTBEAT]', new Date().toISOString()), 15000);
 
 /* ========= Helpers ========= */
-const short = s => (s && s.length > 12 ? s.slice(0,4)+'…'+s.slice(-4) : s);
+const short = s => (s && s.length > 12 ? s.slice(0,4)+'...'+s.slice(-4) : s);
 const fmtUsd = (x, frac=2) => (x==null ? 'n/a' : '$'+Number(x).toLocaleString(undefined,{maximumFractionDigits:frac}));
 const fmtSol = (x, frac=4) => (x==null ? 'n/a' : Number(x).toLocaleString(undefined,{maximumFractionDigits:frac})+' SOL');
 const fmtPct = x => (x==null ? 'n/a' : (Number(x)*100).toFixed(2)+'%');
@@ -83,15 +83,17 @@ async function fetchJSONWithBackoff(url, opts={}, maxRetries=5, baseDelayMs=500)
     try{
       const res = await fetch(url, opts);
       if (res.status===429 || res.status===503){
-        const ra = Number(res.headers.get('retry-after'))||0;
+        const ra = Number(res.headers.get('retry-after')) || 0;
         const wait = Math.max(delay, ra*1000);
         console.warn(`[backoff] ${res.status} retry in ${wait}ms`);
-        await new Promise(r=>setTimeout(r, wait)); delay*=2; continue;
+        await new Promise(r=>setTimeout(r, wait));
+        delay *= 2; continue;
       }
       if (!isJsonLike(res)){
         const _ = await res.text().catch(()=> '');
         console.warn(`[backoff] non-JSON (${res.status}) retry in ${delay}ms`);
-        await new Promise(r=>setTimeout(r, delay)); delay*=2; continue;
+        await new Promise(r=>setTimeout(r, delay));
+        delay *= 2; continue;
       }
       const json = await res.json();
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${JSON.stringify(json).slice(0,180)}`);
@@ -99,7 +101,8 @@ async function fetchJSONWithBackoff(url, opts={}, maxRetries=5, baseDelayMs=500)
     }catch(e){
       if (i===maxRetries) throw e;
       console.warn(`[backoff] err: ${e?.message||e}. retry in ${delay}ms`);
-      await new Promise(r=>setTimeout(r, delay)); delay*=2;
+      await new Promise(r=>setTimeout(r, delay));
+      delay *= 2;
     }
   }
   throw new Error('unreachable');
@@ -162,8 +165,7 @@ function parseBurnNodes(nodes){
   return out;
 }
 
-/* ========= Price sources ========= */
-// Birdeye
+/* ========= Price sources (Birdeye priority) ========= */
 async function priceFromBirdeye(mint){
   if (!BIRDEYE_API_KEY) return null;
   try{
@@ -177,7 +179,6 @@ async function priceFromBirdeye(mint){
   }catch(e){ console.warn('[birdeye] fail:', e?.message||e); }
   return null;
 }
-// Jupiter
 async function priceFromJupiter(mint){
   const urls = [
     `https://price.jup.ag/v6/price?ids=${encodeURIComponent(mint)}`,
@@ -192,7 +193,6 @@ async function priceFromJupiter(mint){
   }
   return null;
 }
-// DexScreener
 async function priceFromDexScreener(mint){
   try{
     const j = await fetchJSONWithBackoff(
@@ -231,7 +231,7 @@ async function getUsdPriceByMint(mint){
   return price;
 }
 
-// SOL/USD (Jupiter)
+// SOL/USD via Jupiter
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 async function getSolUsd(){
   const now = Date.now();
@@ -254,7 +254,7 @@ async function prefetchPrices(burns){
   }
 }
 
-/* ========= DexScreener extra info (name/liquidity/etc) ========= */
+/* ========= DexScreener enrich (name/liquidity/links/socials) ========= */
 async function enrichDexScreener(mint){
   try{
     const j = await fetchJSONWithBackoff(
@@ -341,7 +341,7 @@ function renderTop(top10, pct, supplyUi){
   return lines.join('\n') + (pct!=null?`\n└ Top10 share: ${fmtPct(pct)}`:'');
 }
 
-/* ========= Post report (USD + SOL) ========= */
+/* ========= Post report ========= */
 async function postReport(burn){
   let usd = (typeof burn.amountUsd==='number' && burn.amountUsd>0) ? burn.amountUsd : null;
   let tokenPriceUsd = null, solUsd = null, sol = null;
@@ -355,7 +355,7 @@ async function postReport(burn){
     if (solUsd) sol = usd / solUsd;
   }
 
-  // küszöb: ha MIN_USD <= 0, mindig posztolunk
+  // threshold: MIN_USD <= 0 -> always post (even if usd is null)
   const meets = (cfg.minUsd <= 0) ? true : ((usd ?? 0) >= cfg.minUsd);
   if (!meets){
     console.log(`[SKIP<$${cfg.minUsd}] ${short(burn.sig)} mint=${short(burn.mint)} amount=${burn.amount} usd=${usd}`);
@@ -374,12 +374,8 @@ async function postReport(burn){
   const nameLine = ds?.name ? `${ds.name}` : short(burn.mint||'Token');
 
   const lines = [];
-
-  // CÍM (token név)
   lines.push(`${nameLine}`);
   lines.push('');
-
-  // FŐ META blokk a példád mintájára
   lines.push(`🔥 Burn Percentage: —`);
   lines.push(`🕒 Trading Start Time: ${tradeStart}`);
   lines.push('');
@@ -387,35 +383,24 @@ async function postReport(burn){
   lines.push(`💧 Liquidity: ${fmtUsd(liqUsd,0)}${ratio?` (${fmtNum(ratio,2)} MCAP/LP)`:''}`);
   lines.push(`💲 Price: ${priceUsd!=null?fmtUsd(priceUsd,6):'n/a'}`);
   lines.push('');
-
-  // ÉGETETT MENNYISÉG (USD + SOL)
   if (typeof burn.amount==='number'){
     const usdTxt = (usd!=null) ? fmtUsd(usd,0) : 'n/a';
     const solTxt = (sol!=null) ? fmtSol(sol,4) : 'n/a';
     lines.push(`🔥 Burned Amount: ${fmtNum(burn.amount,4)}  (~${usdTxt} | ${solTxt})`);
   }
   lines.push('');
-
-  // SUPPLY
   lines.push(`📦 Total Supply: ${fmtNum(stats?.supplyUi,0)}`);
   lines.push('');
-
-  // SOCIALS + SECURITY blokk
   lines.push(`🌐 Socials: ${socials}    ⚙️ Security:`);
   lines.push(renderSecurity(stats?.mintRenounced, stats?.freezeRenounced));
   lines.push('');
-
-  // TOP HOLDERS
   lines.push(`👑 Top Holders:`);
   lines.push(renderTop(stats?.top10, stats?.top10Pct, stats?.supplyUi));
   lines.push('');
-
-  // Linkek
   lines.push(links(burn.sig, burn.mint, ds?.url));
   if (burn.mint) lines.push(`\n${burn.mint}`);
 
   const text = lines.join('\n');
-
   try{
     await bot.telegram.sendMessage(CHANNEL_ID, text, { parse_mode:'Markdown', disable_web_page_preview:true });
     console.log(`[POSTED] ${short(burn.sig)} ~${usd!=null?usd.toFixed(0):'n/a'}$ ${sol!=null?`(${sol.toFixed(4)} SOL)`:''}`);
@@ -446,7 +431,7 @@ async function pollOnce(){
       if (ok) seen.set(k, nowMs());
     }
   }catch(e){
-    console.error('[Bitquery] fetch error:', e?.message || e);
+    console.error('[Bitquery] fetch error]:', e?.message || e);
   }finally{
     console.log('[POLL] end', new Date().toISOString());
   }
