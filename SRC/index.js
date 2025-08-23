@@ -4,46 +4,56 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-// ====== ENV változók ======
+// ====== ENV ======
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
-// ====== Bitquery GraphQL lekérdezés ======
-const query = `
-query {
-  solana(network: solana) {
-    transfers(
-      options: {desc: "block.timestamp.time", limit: 5}
-      currency: {is: "SOL"}
-      amount: {gt: 0}
-    ) {
-      block {
-        timestamp {
-          time(format: "%Y-%m-%d %H:%M:%S")
+const BITQUERY_URL = "https://graphql.bitquery.io";
+const BURN_ADDRESSES = [
+  "11111111111111111111111111111111",
+  "1nc1nerator11111111111111111111111111111"
+];
+const LP_BURN_THRESHOLD = 95; // %
+
+// ====== LP burn események lekérdezése ======
+async function fetchLPBurns() {
+  const query = `
+  query LPBurns {
+    solana(network: solana) {
+      transfers(
+        options: {desc: "block.timestamp.time", limit: 10}
+        date: {since: "2025-08-23T00:00:00"}
+        receiver: {in: ${JSON.stringify(BURN_ADDRESSES)}}
+      ) {
+        block {
+          timestamp {
+            time(format: "%Y-%m-%d %H:%M:%S")
+          }
         }
-      }
-      amount
-      sender {
-        address
-      }
-      receiver {
-        address
-      }
-      currency {
-        symbol
+        amount
+        currency {
+          symbol
+          address
+        }
+        sender {
+          address
+        }
+        receiver {
+          address
+        }
+        transaction {
+          signature
+        }
       }
     }
   }
-}
-`;
+  `;
 
-// ====== Adatok lekérdezése Bitquery API-tól ======
-async function fetchBurnEvents() {
   try {
-    const response = await fetch("https://graphql.bitquery.io", {
+    const response = await fetch(BITQUERY_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -53,48 +63,84 @@ async function fetchBurnEvents() {
     });
 
     if (!response.ok) {
-      throw new Error(`Bitquery API error! Status: ${response.status}`);
+      throw new Error(`Bitquery API error: ${response.status} ${response.statusText}`);
     }
 
-    const result = await response.json();
-
-    if (result.errors) {
-      console.error("Bitquery GraphQL hiba:", result.errors);
+    const data = await response.json();
+    if (data.errors) {
+      console.error("⚠️ Bitquery GraphQL hiba:", data.errors);
       return [];
     }
 
-    return result.data?.solana?.transfers || [];
+    return data.data?.solana?.transfers || [];
   } catch (error) {
-    console.error("⚠️ Bitquery fetch hiba:", error.message);
+    console.error("⚠️ Fetch hiba:", error.message);
     return [];
   }
 }
 
-// ====== Új események figyelése ======
-async function checkEvents() {
-  console.log("🔍 Ellenőrzés indul...");
-  const events = await fetchBurnEvents();
+// ====== Token total supply lekérdezése ======
+async function fetchTotalSupply(tokenAddress) {
+  const query = `
+    query TokenSupply {
+      solana(network: solana) {
+        address(address: {is: "${tokenAddress}"}) {
+          annotation {
+            totalSupply
+          }
+        }
+      }
+    }
+  `;
 
-  if (!events.length) {
+  try {
+    const response = await fetch(BITQUERY_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${BITQUERY_API_KEY}`,
+      },
+      body: JSON.stringify({ query }),
+    });
+
+    const data = await response.json();
+    return data.data?.solana?.address?.[0]?.annotation?.totalSupply || 0;
+  } catch {
+    return 0;
+  }
+}
+
+// ====== Események feldolgozása ======
+async function checkLPBurns() {
+  console.log("🔄 Ellenőrzés indul...");
+  const burns = await fetchLPBurns();
+
+  if (!burns.length) {
     console.log("ℹ️ Nincs új LP burn esemény.");
     return;
   }
 
-  for (const e of events) {
-    const msg = `
-🔥 Új LP Burn esemény!
+  for (const burn of burns) {
+    const totalSupply = await fetchTotalSupply(burn.currency.address);
+    if (!totalSupply || totalSupply === 0) continue;
 
-💰 Összeg: ${e.amount} ${e.currency.symbol}
-📤 Küldő: ${e.sender.address}
-📥 Fogadó: ${e.receiver.address}
-🕒 Időpont: ${e.block.timestamp.time}
-    `;
-    await bot.sendMessage(CHANNEL_ID, msg.trim());
+    const percentBurned = (burn.amount / totalSupply) * 100;
+
+    if (percentBurned >= LP_BURN_THRESHOLD) {
+      const msg = `
+🔥 **ÚJ LP BURN** 🔥
+Token: ${burn.currency.symbol}
+Elégetett LP: ${percentBurned.toFixed(2)}%
+Burn cím: ${burn.receiver.address}
+Tx: https://solscan.io/tx/${burn.transaction.signature}
+⏰ Idő: ${burn.block.timestamp.time}
+      `;
+      console.log(msg);
+      await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
+    }
   }
 }
 
 // ====== Indítás ======
-console.log("🚀 LP Burn Bot elindult, figyeli az eseményeket!");
-
-// 30 másodpercenként ellenőriz
-setInterval(checkEvents, 30000);
+console.log("🚀 LP Burn Bot elindult! Csak Bitquery API-t használ.");
+setInterval(checkLPBurns, 10000);
