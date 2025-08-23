@@ -3,35 +3,55 @@ import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
 dotenv.config();
 
-// ====== KONFIG ======
+// ====== TELEGRAM BOT ======
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
 
+// ====== API URL-ek ======
 const BITQUERY_URL = "https://graphql.bitquery.io";
 const RAYDIUM_API = "https://api.raydium.io/v2/sdk/liquidity/mainnet.json";
 const ORCA_API = "https://api.orca.so/pools";
 
+// ====== AXIOS ALAPBEÁLLÍTÁS ======
+const axiosInstance = axios.create({
+  timeout: 5000, // 5 másodperc
+});
+
 // ====== LP TOKEN LISTA ======
 let LP_TOKENS = [];
 
-// ====== LP POOL FRISSÍTÉS ======
+// ====== LP POOL LISTA FRISSÍTÉS ======
 async function updatePools() {
   console.log("🔹 LP poolok frissítése indul...");
+  let rayPools = [];
+  let orcaPools = [];
+
+  // Raydium poolok
   try {
-    const [rayRes, orcaRes] = await Promise.all([
-      axios.get(RAYDIUM_API),
-      axios.get(ORCA_API),
-    ]);
-
-    const rayPools = Object.values(rayRes.data).map(p => p.lpMint);
-    const orcaPools = Object.values(orcaRes.data).map(p => p.poolTokenMint);
-
-    LP_TOKENS = [...new Set([...rayPools, ...orcaPools])];
-
-    console.log(`✅ LP pool lista frissítve: ${LP_TOKENS.length} pool figyelve.`);
+    const rayRes = await axiosInstance.get(RAYDIUM_API);
+    rayPools = Object.values(rayRes.data).map(p => p.lpMint);
+    console.log(`✅ Raydium API OK: ${rayPools.length} pool`);
   } catch (err) {
-    console.error("❌ LP pool frissítési hiba:", err.message);
+    console.error("❌ Raydium API hiba:", err.code || err.message);
+  }
+
+  // Orca poolok
+  try {
+    const orcaRes = await axiosInstance.get(ORCA_API);
+    orcaPools = Object.values(orcaRes.data).map(p => p.poolTokenMint);
+    console.log(`✅ Orca API OK: ${orcaPools.length} pool`);
+  } catch (err) {
+    console.error("❌ Orca API hiba:", err.code || err.message);
+  }
+
+  // LP tokenek egyesítése
+  LP_TOKENS = [...new Set([...rayPools, ...orcaPools])];
+
+  if (LP_TOKENS.length > 0) {
+    console.log(`✅ LP pool lista frissítve: ${LP_TOKENS.length} pool figyelve.`);
+  } else {
+    console.warn("⚠️ Figyelem: nincs elérhető LP pool lista!");
   }
 }
 
@@ -61,9 +81,6 @@ async function fetchLPBurns(limit = 30) {
             name
           }
           amount
-          sender {
-            address
-          }
           receiver {
             address
           }
@@ -76,7 +93,7 @@ async function fetchLPBurns(limit = 30) {
   `;
 
   try {
-    const res = await axios.post(
+    const res = await axiosInstance.post(
       BITQUERY_URL,
       { query, variables: { limit, lpTokens: LP_TOKENS } },
       {
@@ -88,7 +105,7 @@ async function fetchLPBurns(limit = 30) {
     );
 
     const transfers = res.data?.data?.solana?.transfers || [];
-    console.log(`📊 Lekérdezve: ${transfers.length} LP burn esemény találat.`);
+    console.log(`📊 Lekérdezve: ${transfers.length} LP burn esemény.`);
     return transfers;
   } catch (e) {
     console.error("❌ Bitquery API hiba:", e.response?.data || e.message);
@@ -96,7 +113,7 @@ async function fetchLPBurns(limit = 30) {
   }
 }
 
-// ====== LP BURN POSZTOLÁS ======
+// ====== LP BURN POSZTOLÁS TELEGRAMRA ======
 async function checkBurnEvents() {
   console.log("🔄 Ellenőrzés indul...");
 
