@@ -1,13 +1,18 @@
-// SRC/index.js — Minimal Sol Burn Bot (CommonJS, no emojis, SOL mode)
-// Filters: MIN_SOL (burn value in SOL), MAX_MCAP_SOL (FDV in SOL), LP fully burned (liqUsd == 0)
+// SRC/index.js — Sol Burn Bot (CommonJS, no emojis, SOL mode)
+// - Bitquery v2 (EAP) TokenSupplyUpdates -> burn-ek
+// - Birdeye ár (SOL/USD + token USD), DexScreener enrich (liqUsd, fdv, socials)
+// - LP filter két módban: strict (csak liqUsd===0) / relaxed (n/a esetén átenged)
+// - Szűrők: MIN_SOL (burn érték SOL-ban), MAX_MCAP_SOL (FDV SOL-ban)
+// - Stabil fetch: undici
+// - Kevesebb rate-limit: hosszabb ár-cache, kevés price-lookup per poll
 
 "use strict";
 
-/* ===== imports ===== */
+/* ===== Imports ===== */
 const dotenv = require("dotenv");
 dotenv.config();
 
-const { fetch } = require("undici"); // garantáltan függvény CommonJS-ben
+const { fetch } = require("undici");
 const { Telegraf } = require("telegraf");
 const { Connection, PublicKey, clusterApiUrl } = require("@solana/web3.js");
 const { getMint } = require("@solana/spl-token");
@@ -16,12 +21,12 @@ const { getMint } = require("@solana/spl-token");
 const {
   BOT_TOKEN,
   CHANNEL_ID,
-  BITQUERY_API_KEY,     // Bitquery v2 EAP Bearer token (ory_at_...)
-  BIRDEYE_API_KEY,      // Birdeye API key
+  BITQUERY_API_KEY,   // Bearer ory_at_...
+  BIRDEYE_API_KEY,    // Birdeye API key
   MIN_SOL = "0",
   MAX_MCAP_SOL = "0",
   POLL_INTERVAL_SEC = "20",
-  POLL_LOOKBACK_SEC = "25",
+  POLL_LOOKBACK_SEC = "12",
   DEDUP_MINUTES = "10",
   RPC_URL
 } = process.env;
@@ -31,11 +36,13 @@ if (!CHANNEL_ID) throw new Error("Missing CHANNEL_ID");
 if (!BITQUERY_API_KEY) throw new Error("Missing BITQUERY_API_KEY");
 if (!BIRDEYE_API_KEY) console.warn("[WARN] Missing BIRDEYE_API_KEY (prices may fail)");
 
-/* ===== admin ===== */
-const ADMIN_IDS = [1721507540]; // <- a te Telegram user ID-d
+/* ===== Admin ===== */
+const ADMIN_IDS = [1721507540]; // <- a te Telegram user ID-d ide
 function isAdmin(ctx){ return !!(ctx && ctx.from && ADMIN_IDS.includes(ctx.from.id)); }
 
-/* ===== globals ===== */
+/* ===== Globals ===== */
+console.log("[BOOT] build=2025-08-23_safelp_v1");
+
 const bot = new Telegraf(BOT_TOKEN);
 const connection = new Connection(RPC_URL || clusterApiUrl("mainnet-beta"), "confirmed");
 
@@ -43,22 +50,25 @@ let cfg = {
   minSol: Number(MIN_SOL) || 0,
   maxMcapSol: Number(MAX_MCAP_SOL) || 0,
   pollIntervalSec: Number(POLL_INTERVAL_SEC) || 20,
-  lookbackSec: Number(POLL_LOOKBACK_SEC) || 25,
+  lookbackSec: Number(POLL_LOOKBACK_SEC) || 12,
   dedupMinutes: Number(DEDUP_MINUTES) || 10
 };
+
+// LP filter mód: true=strict (csak liqUsd==0), false=relaxed (n/a esetén átenged)
+let lpStrict = true;
+
 let pollTimer = null;
+const seen = new Map(); // sig::mint -> ts
 
-const seen = new Map(); // key: sig::mint → ts
-
-// caches
-const PRICE_TTL_MS = 20000;
+// cachek és rate-limit finomhangolás
+const PRICE_TTL_MS = 180000; // 3 perc
 const priceCache = new Map(); // mint -> { usdPrice, ts }
 const solUsdCache = { price: null, ts: 0 };
 const MAX_PRICE_LOOKUPS_PER_POLL = 2;
 
 setInterval(function(){ console.log("[HEARTBEAT]", new Date().toISOString()); }, 15000);
 
-/* ===== helpers ===== */
+/* ===== Helpers ===== */
 function short(s){ return (s && s.length > 12 ? s.slice(0,4)+"..."+s.slice(-4) : s); }
 function fmtSol(x, frac){ if (frac==null) frac=4; return (x==null ? "n/a" : Number(x).toLocaleString(undefined,{maximumFractionDigits:frac})+" SOL"); }
 function fmtNum(x, frac){ if (frac==null) frac=0; return (x==null ? "n/a" : Number(x).toLocaleString(undefined,{maximumFractionDigits:frac})); }
@@ -140,7 +150,6 @@ function GQL(sec){
     "}"
   ].join("\n");
 }
-
 async function bitqueryFetch(query){
   const json = await fetchJSONWithBackoff(
     "https://streaming.bitquery.io/eap",
@@ -231,7 +240,7 @@ async function prefetchPrices(burns){
   }
 }
 
-/* ===== DexScreener enrich (liq, fdv, name, socials, url) ===== */
+/* ===== DexScreener enrich ===== */
 async function enrichDexScreener(mint){
   try{
     const j = await fetchJSONWithBackoff(
@@ -249,10 +258,11 @@ async function enrichDexScreener(mint){
     const best = arr[0];
     if (!best) return null;
 
-    const liqUsd = Number(best.liquidity && best.liquidity.usd ? best.liquidity.usd : null) || null;
-    const fdv    = Number(best.fdv || null) || null;
-    const name   = (best.baseToken && (best.baseToken.name || best.baseToken.symbol)) ? (best.baseToken.name || best.baseToken.symbol) : short(mint);
-    const url    = best.url || ("https://dexscreener.com/solana/"+mint);
+    const priceUsd = Number(best.priceUsd || null) || null;
+    const liqUsd   = Number(best.liquidity && best.liquidity.usd ? best.liquidity.usd : null) || null;
+    const fdv      = Number(best.fdv || null) || null;
+    const ratio    = (fdv && liqUsd) ? (fdv/liqUsd) : null;
+    const createdMs = best.pairCreatedAt ? Number(best.pairCreatedAt) : null;
 
     const info = best.info || {};
     const websites = info.websites || [];
@@ -265,7 +275,7 @@ async function enrichDexScreener(mint){
       if ((t==="twitter" || t==="x") && socials[i].url) tw = socials[i].url;
     }
 
-    return { liqUsd: liqUsd, fdv: fdv, name: name, url: url, site: site, tg: tg, tw: tw };
+    return { priceUsd: priceUsd, liqUsd: liqUsd, fdv: fdv, ratio: ratio, createdMs: createdMs, site: site, tg: tg, tw: tw, url: best.url || ("https://dexscreener.com/solana/"+mint), name: (best.baseToken && (best.baseToken.name || best.baseToken.symbol)) ? (best.baseToken.name || best.baseToken.symbol) : short(mint) };
   }catch(e){
     console.warn("DexScreener enrich fail:", e && e.message ? e.message : e);
     return null;
@@ -297,7 +307,7 @@ async function rpcStats(mintStr){
   return { supplyUi: supplyUi, top10: top10, top10Pct: top10Pct, mintRenounced: mintRenounced, freezeRenounced: freezeRenounced };
 }
 
-/* ===== formatting ===== */
+/* ===== Formatting ===== */
 function links(sig, mint, dsUrl){
   const out=[];
   if (sig) out.push("[Solscan](https://solscan.io/tx/"+sig+")");
@@ -329,33 +339,43 @@ function renderTop(top10, pct, supplyUi){
   return lines.join("\n");
 }
 
-/* ===== post ===== */
+/* ===== Post ===== */
 async function postReport(burn){
-  // prices
   const solUsd = await getSolUsd();
   let tokenUsd = null;
   if (burn.mint) tokenUsd = await getUsdPriceByMint(burn.mint);
 
-  // burn value in SOL
   let burnSol = null;
   if (typeof burn.amount==="number" && burn.amount>0 && tokenUsd!=null && solUsd){
     burnSol = (burn.amount * tokenUsd) / solUsd;
   }
 
-  // MIN_SOL
-  const meetsMinSol = (cfg.minSol <= 0) ? true : (burnSol != null && burnSol >= cfg.minSol);
-  if (!meetsMinSol){
-    console.log("[SKIP < MIN_SOL] sig="+short(burn.sig)+" mint="+short(burn.mint)+" burnSol="+burnSol);
-    return false;
+  // MIN_SOL csak akkor szűr, ha tényleg > 0
+  if (cfg.minSol > 0) {
+    if (burnSol == null) {
+      console.log("[SKIP PRICE_MISSING] sig="+short(burn.sig)+" mint="+short(burn.mint)+" reason=no price (tokenUsd or solUsd missing)");
+      return false;
+    }
+    if (burnSol < cfg.minSol) {
+      console.log("[SKIP < MIN_SOL="+cfg.minSol+"] sig="+short(burn.sig)+" mint="+short(burn.mint)+" burnSol="+burnSol);
+      return false;
+    }
   }
 
-  // enrich
   const ds = burn.mint ? await enrichDexScreener(burn.mint) : null;
 
-  // LP fully burned
-  if (!(ds && ds.liqUsd === 0)){
-    console.log("[SKIP LP not fully burned] sig="+short(burn.sig)+" mint="+short(burn.mint)+" liqUsd="+(ds ? ds.liqUsd : "n/a"));
-    return false;
+  // LP filter
+  if (lpStrict) {
+    if (!(ds && ds.liqUsd === 0)) {
+      console.log("[SKIP LP not fully burned] sig="+short(burn.sig)+" mint="+short(burn.mint)+" liqUsd="+(ds ? ds.liqUsd : "n/a"));
+      return false;
+    }
+  } else {
+    if (ds && typeof ds.liqUsd === "number" && ds.liqUsd > 0) {
+      console.log("[SKIP LP>0 (relaxed)] sig="+short(burn.sig)+" mint="+short(burn.mint)+" liqUsd="+ds.liqUsd);
+      return false;
+    }
+    // ds==null vagy liqUsd==null -> átengedjük
   }
 
   // MCAP in SOL
@@ -366,10 +386,8 @@ async function postReport(burn){
     return false;
   }
 
-  // rpc stats
   const stats = burn.mint ? await rpcStats(burn.mint) : {};
 
-  // message
   const nameLine = ds && ds.name ? ds.name : short(burn.mint || "Token");
   const tradeStart = ds && ds.createdMs ? minutesAgo(ds.createdMs) : "n/a";
   const socials = (function(){
@@ -385,7 +403,7 @@ async function postReport(burn){
   lines.push("Trading Start Time: " + tradeStart);
   lines.push("");
   lines.push("Marketcap: " + (mcapSol!=null ? fmtSol(mcapSol,2) : "n/a"));
-  lines.push("Liquidity: 0 SOL (LP fully burned)");
+  lines.push("Liquidity: " + (ds && typeof ds.liqUsd==="number" ? (ds.liqUsd===0 ? "0 SOL (LP fully burned)" : "has liquidity") : "n/a"));
   lines.push("Price: " + (tokenUsd!=null && solUsd ? fmtSol(tokenUsd/solUsd,6) : "n/a"));
   lines.push("");
   if (typeof burn.amount==="number"){
@@ -407,7 +425,7 @@ async function postReport(burn){
   const text = lines.join("\n");
   try{
     await bot.telegram.sendMessage(CHANNEL_ID, text, { disable_web_page_preview:true });
-    console.log("[POSTED] sig="+short(burn.sig)+" burnSol="+(burnSol!=null ? burnSol.toFixed(4) : "n/a")+" SOL");
+    console.log("[POSTED] sig="+short(burn.sig)+" burnSol="+(burnSol!=null ? burnSol.toFixed(6) : "n/a")+" SOL");
     return true;
   }catch(e){
     console.error("[sendMessage ERROR]", (e && (e.description || e.message)) ? (e.description || e.message) : e);
@@ -415,7 +433,7 @@ async function postReport(burn){
   }
 }
 
-/* ===== poll ===== */
+/* ===== Polling ===== */
 async function pollOnce(){
   console.log("[POLL] start", new Date().toISOString());
   pruneSeen();
@@ -447,7 +465,7 @@ function restartPolling(){
   console.log("[POLL] setInterval "+cfg.pollIntervalSec+" sec");
 }
 
-/* ===== commands ===== */
+/* ===== Commands ===== */
 bot.command("ping", function(ctx){ return ctx.reply("pong"); });
 bot.command("status", function(ctx){
   const msg = [
@@ -457,7 +475,7 @@ bot.command("status", function(ctx){
     "POLL_INTERVAL_SEC="+cfg.pollIntervalSec,
     "POLL_LOOKBACK_SEC="+cfg.lookbackSec,
     "DEDUP_MINUTES="+cfg.dedupMinutes,
-    "LP filter: only post when liqUsd == 0"
+    "LP mode="+(lpStrict ? "strict (only liqUsd==0)" : "relaxed (n/a allowed)")
   ].join("\n");
   return ctx.reply(msg);
 });
@@ -477,8 +495,17 @@ bot.command("setmaxmcap", function(ctx){
   cfg.maxMcapSol = v;
   return ctx.reply("MAX_MCAP_SOL set to "+(v>0 ? (v+" SOL") : "off"));
 });
+bot.command("setlp", function(ctx){
+  if (!isAdmin(ctx)) return ctx.reply("No permission.");
+  const arg = (ctx.message && ctx.message.text ? ctx.message.text.split(" ")[1] : "") || "";
+  if (!["strict","relaxed"].includes(arg)) {
+    return ctx.reply("Usage: /setlp strict|relaxed\nstrict = only liqUsd==0 posts\nrelaxed = if liqUsd n/a, still post");
+  }
+  lpStrict = (arg === "strict");
+  return ctx.reply("LP mode set to "+(lpStrict ? "strict" : "relaxed"));
+});
 
-/* ===== start (409-safe) ===== */
+/* ===== Start (409-safe) ===== */
 (async function(){
   try{ await bot.telegram.deleteWebhook({ drop_pending_updates:true }); }catch(e){}
   try{
@@ -493,7 +520,7 @@ bot.command("setmaxmcap", function(ctx){
       "MIN_SOL >= "+cfg.minSol+" SOL",
       "MAX_MCAP_SOL "+(cfg.maxMcapSol>0 ? ("<= "+cfg.maxMcapSol+" SOL") : "off"),
       "Poll="+cfg.pollIntervalSec+"s  Window="+cfg.lookbackSec+"s  Dedup="+cfg.dedupMinutes+"m",
-      "LP filter: only when LP fully burned (liqUsd == 0)",
+      "LP mode="+(lpStrict ? "strict (only liqUsd==0)" : "relaxed (n/a allowed)"),
       "Price: Birdeye"
     ].join("\n");
     await bot.telegram.sendMessage(CHANNEL_ID, boot);
