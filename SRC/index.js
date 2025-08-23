@@ -1,16 +1,21 @@
-// SRC/index.js — Sol Burn Bot (Bitquery v2 EAP)
-// SOL mode, no emojis, only post when LP fully burned (liqUsd == 0)
-// Filters: MIN_SOL (burn value in SOL), MAX_MCAP_SOL (FDV/MCAP in SOL)
-// Prices from Birdeye (needs BIRDEYE_API_KEY). DexScreener only for enrich.
-// No backticks anywhere to avoid copy/paste syntax issues.
+// SRC/index.js — Sol Burn Bot (Bitquery v2, CommonJS, no emojis, SOL mode)
+// - Csak akkor posztol, ha az LP teljesen 0 USD (LP fully burned feltétel)
+// - Szűrők: MIN_SOL (burn érték SOL-ban), MAX_MCAP_SOL (FDV/MCAP SOL-ban)
+// - Ár Birdeye-ról (BIRDEYE_API_KEY kell). DexScreener csak enrichmentre.
+// - Nincsenek backticek, nincsenek emojik.
 
-import "dotenv/config";
-import fetch from "node-fetch";
-import { Telegraf } from "telegraf";
-import { Connection, PublicKey, clusterApiUrl } from "@solana/web3.js";
-import { getMint } from "@solana/spl-token";
+"use strict";
 
-/* ========= ENV ========= */
+/* ====== imports (CommonJS) ====== */
+const dotenv = require("dotenv");
+dotenv.config();
+
+const fetch = require("node-fetch");
+const { Telegraf } = require("telegraf");
+const { Connection, PublicKey, clusterApiUrl } = require("@solana/web3.js");
+const { getMint } = require("@solana/spl-token");
+
+/* ====== ENV ====== */
 const {
   BOT_TOKEN,
   CHANNEL_ID,
@@ -29,11 +34,11 @@ if (!CHANNEL_ID) throw new Error("Missing CHANNEL_ID");
 if (!BITQUERY_API_KEY) throw new Error("Missing BITQUERY_API_KEY");
 if (!BIRDEYE_API_KEY) console.warn("[WARN] No BIRDEYE_API_KEY provided. Prices may fail.");
 
-/* ========= Admin ========= */
-const ADMIN_IDS = [1721507540]; // your Telegram user id
-function isAdmin(ctx) { return !!(ctx && ctx.from && ADMIN_IDS.includes(ctx.from.id)); }
+/* ====== Admin ====== */
+const ADMIN_IDS = [1721507540]; // a te Telegram ID-d
+function isAdmin(ctx){ return !!(ctx && ctx.from && ADMIN_IDS.includes(ctx.from.id)); }
 
-/* ========= Globals ========= */
+/* ====== Globals ====== */
 const bot = new Telegraf(BOT_TOKEN);
 const connection = new Connection(RPC_URL || clusterApiUrl("mainnet-beta"), "confirmed");
 
@@ -50,13 +55,13 @@ const seen = new Map(); // sig::mint -> ts
 
 // caches
 const PRICE_TTL_MS = 60 * 1000;
-const priceCache = new Map();   // token mint -> { usdPrice, ts }
-const solUsdCache = { price: null, ts: 0 }; // SOL/USD cache
+const priceCache = new Map(); // mint -> { usdPrice, ts }
+const solUsdCache = { price: null, ts: 0 }; // SOL/USD
 const MAX_PRICE_LOOKUPS_PER_POLL = 6;
 
 setInterval(function(){ console.log("[HEARTBEAT]", new Date().toISOString()); }, 15000);
 
-/* ========= Helpers ========= */
+/* ====== Helpers ====== */
 function short(s){ return (s && s.length > 12 ? s.slice(0,4) + "..." + s.slice(-4) : s); }
 function fmtSol(x, frac){ if (frac==null) frac=4; return (x==null ? "n/a" : Number(x).toLocaleString(undefined,{maximumFractionDigits:frac}) + " SOL"); }
 function fmtNum(x, frac){ if (frac==null) frac=0; return (x==null ? "n/a" : Number(x).toLocaleString(undefined,{maximumFractionDigits:frac})); }
@@ -118,8 +123,8 @@ async function fetchJSONWithBackoff(url, opts, maxRetries, baseDelayMs){
   throw new Error("unreachable");
 }
 
-/* ========= Bitquery (v2 EAP) ========= */
-const GQL = function(sec){
+/* ====== Bitquery (v2 EAP) ====== */
+function GQL(sec){
   return [
     "query BurnsLastWindow {",
     "  Solana(dataset: realtime, network: solana) {",
@@ -138,7 +143,7 @@ const GQL = function(sec){
     "  }",
     "}"
   ].join("\n");
-};
+}
 
 async function bitqueryFetch(query){
   const json = await fetchJSONWithBackoff(
@@ -163,7 +168,7 @@ function parseBurnNodes(nodes){
     const sig = n && n.Transaction ? n.Transaction.Signature : null;
     const tu = n ? n.TokenSupplyUpdate : null;
     const mint = tu && tu.Currency ? tu.Currency.MintAddress : null;
-    const decimals = tu && tu.Currency && Number(tu.Currency.Decimals) ? Number(tu.Currency.Decimals) : 0;
+    const decimals = tu && tu.Currency && isFinite(Number(tu.Currency.Decimals)) ? Number(tu.Currency.Decimals) : 0;
     const rawAmt = Number(tu ? tu.Amount : NaN);
     const rawUsd = Number(tu ? tu.AmountInUSD : NaN);
     const absAmt = isFinite(rawAmt) ? Math.abs(rawAmt) : null;
@@ -179,7 +184,7 @@ function parseBurnNodes(nodes){
   return out;
 }
 
-/* ========= Prices (Birdeye) ========= */
+/* ====== Prices (Birdeye) ====== */
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 async function getUsdPriceByMint(mint){
@@ -236,7 +241,7 @@ async function prefetchPrices(burns){
   }
 }
 
-/* ========= DexScreener enrich ========= */
+/* ====== DexScreener enrich ====== */
 async function enrichDexScreener(mint){
   try{
     const j = await fetchJSONWithBackoff(
@@ -279,7 +284,7 @@ async function enrichDexScreener(mint){
   }
 }
 
-/* ========= RPC stats ========= */
+/* ====== RPC stats ====== */
 async function rpcStats(mintStr){
   const mintPk = new PublicKey(mintStr);
   let supplyUi=null, top10=[], top10Pct=null, mintRenounced=null, freezeRenounced=null;
@@ -304,7 +309,7 @@ async function rpcStats(mintStr){
   return { supplyUi: supplyUi, top10: top10, top10Pct: top10Pct, mintRenounced: mintRenounced, freezeRenounced: freezeRenounced };
 }
 
-/* ========= Formatting ========= */
+/* ====== Formatting ====== */
 function links(sig, mint, dsUrl){
   const out=[];
   if (sig) out.push("[Solscan](https://solscan.io/tx/" + sig + ")");
@@ -336,7 +341,7 @@ function renderTop(top10, pct, supplyUi){
   return lines.join("\n");
 }
 
-/* ========= Post (SOL-first) ========= */
+/* ====== Post (SOL-first) ====== */
 async function postReport(burn){
   // prices
   const solUsd = await getSolUsd();
@@ -359,13 +364,13 @@ async function postReport(burn){
   // Enrichment
   const ds = burn.mint ? await enrichDexScreener(burn.mint) : null;
 
-  // LP fully burned: require liqUsd === 0
+  // LP fully burned: require liqUsd === 0 (if no data -> skip)
   if (!(ds && ds.liqUsd === 0)){
     console.log("[SKIP LP not fully burned] sig=" + short(burn.sig) + " mint=" + short(burn.mint) + " liqUsd=" + (ds ? ds.liqUsd : "n/a"));
     return false;
   }
 
-  // MCAP filter (in SOL)
+  // MCAP filter in SOL
   let mcapSol = null;
   if (ds && ds.fdv && solUsd) mcapSol = ds.fdv / solUsd;
   const hasMax = cfg.maxMcapSol > 0;
@@ -377,7 +382,7 @@ async function postReport(burn){
   // RPC stats
   const stats = burn.mint ? await rpcStats(burn.mint) : {};
 
-  // Build message (plain text)
+  // Message (plain text)
   const nameLine = ds && ds.name ? ds.name : short(burn.mint || "Token");
   const ratio    = ds ? ds.ratio : null;
   const tradeStart = ds && ds.createdMs ? minutesAgo(ds.createdMs) : "n/a";
@@ -424,7 +429,7 @@ async function postReport(burn){
   }
 }
 
-/* ========= Polling ========= */
+/* ====== Polling ====== */
 async function pollOnce(){
   console.log("[POLL] start", new Date().toISOString());
   pruneSeen();
@@ -456,7 +461,7 @@ function restartPolling(){
   console.log("[POLL] setInterval " + cfg.pollIntervalSec + " sec");
 }
 
-/* ========= Commands ========= */
+/* ====== Commands ====== */
 bot.command("ping", function(ctx){ return ctx.reply("pong"); });
 bot.command("status", function(ctx){
   const msg = [
@@ -487,7 +492,7 @@ bot.command("setmaxmcap", function(ctx){
   return ctx.reply("MAX_MCAP_SOL set to " + (v>0 ? (v + " SOL") : "off"));
 });
 
-/* ========= Start (409-safe) ========= */
+/* ====== Start (409-safe) ====== */
 (async function(){
   try{ await bot.telegram.deleteWebhook({ drop_pending_updates:true }); }catch(e){}
   try{
@@ -497,15 +502,13 @@ bot.command("setmaxmcap", function(ctx){
     console.error("Telegraf launch failed:", (e && (e.description || e.message)) ? (e.description || e.message) : e);
   }
   try{
-    await bot.telegram.sendMessage(
-      CHANNEL_ID,
-      [
-        "BurnBot started (SOL mode)",
-        "MIN_SOL >= " + cfg.minSol + " SOL",
-        "MAX_MCAP_SOL " + (cfg.maxMcapSol>0 ? ("<= " + cfg.maxMcapSol + " SOL") : "off"),
-        "Poll=" + cfg.pollIntervalSec + "s  Window=" + cfg.lookbackSec + "s  Dedup=" + cfg.dedupMinutes + "m",
-        "LP filter: only when LP fully burned (liqUsd == 0)",
-        "Price: Birdeye"
-      ].join("\n")
-    );
-  }catch(e){ console.error("[startup send error]", e && e.message ? e.message : e); }
+    const boot = [
+      "BurnBot started (SOL mode)",
+      "MIN_SOL >= " + cfg.minSol + " SOL",
+      "MAX_MCAP_SOL " + (cfg.maxMcapSol>0 ? ("<= " + cfg.maxMcapSol + " SOL") : "off"),
+      "Poll=" + cfg.pollIntervalSec + "s  Window=" + cfg.lookbackSec + "s  Dedup=" + cfg.dedupMinutes + "m",
+      "LP filter: only when LP fully burned (liqUsd == 0)",
+      "Price: Birdeye"
+    ].join("\n");
+    await bot.telegram.sendMessage(CHANNEL_ID, boot);
+  }catch(e){ console.error("[startup send error]", e && e.mes
