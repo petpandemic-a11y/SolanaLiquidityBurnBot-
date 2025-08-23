@@ -1,4 +1,4 @@
-// SRC/index.js — PRO verzió + /post teszt
+// SRC/index.js — PRO bot + /post + /debug
 import 'dotenv/config';
 import fetch from 'node-fetch';
 import { Telegraf } from 'telegraf';
@@ -151,16 +151,16 @@ async function enrichDexScreener(mint){
 
 // -------------------- RPC: supply, top10, authorities --------------------
 async function rpcStats(mintStr){
-  const mint = new PublicKey(mintStr);
+  const mintPk = new PublicKey(mintStr);
   let supplyUi=null, top10=[], top10Pct=null, mintRenounced=null, freezeRenounced=null;
 
   try{
-    const s = await connection.getTokenSupply(mint);
+    const s = await connection.getTokenSupply(mintPk);
     supplyUi = s?.value?.uiAmount ?? null;
   }catch(e){ console.error('getTokenSupply error:', e?.message); }
 
   try{
-    const largest = await connection.getTokenLargestAccounts(mint);
+    const largest = await connection.getTokenLargestAccounts(mintPk);
     const arr = largest?.value || [];
     top10 = arr.slice(0,10).map(v => ({ address: v.address.toBase58(), amount: v.uiAmount }));
     if (supplyUi && supplyUi > 0){
@@ -170,7 +170,7 @@ async function rpcStats(mintStr){
   }catch(e){ console.error('getTokenLargestAccounts error:', e?.message); }
 
   try{
-    const mi = await getMint(connection, mint);
+    const mi = await getMint(connection, mintPk);
     mintRenounced = (mi?.mintAuthority === null);
     freezeRenounced = (mi?.freezeAuthority === null);
   }catch(e){ console.error('getMint error:', e?.message); }
@@ -201,7 +201,7 @@ function renderSecurity(mintRenounced, freezeRenounced){
   return `${meta}\n${mint}\n${frz}`;
 }
 
-// -------------------- posting --------------------
+// -------------------- Telegram posting --------------------
 async function postReport(burn){
   const minUsd = Number(MIN_USD);
   let usd=null;
@@ -285,10 +285,27 @@ async function pollOnce(){
   }
 }
 
+// -------------------- DEBUG helper + parancs --------------------
+async function debugFetchBurns(seconds = 60) {
+  try {
+    const res = await fetch('https://streaming.bitquery.io/graphql', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-KEY': process.env.BITQUERY_API_KEY },
+      body: JSON.stringify({ query: GQL(seconds) })
+    });
+    const j = await res.json();
+    if (j.errors) return { ok:false, err: JSON.stringify(j.errors) };
+    const nodes = j?.data?.Solana?.Instructions || [];
+    const burns = parseBurnNodes(nodes);
+    return { ok:true, nodes: nodes.length, burns: burns.length, preview: burns.slice(0,3) };
+  } catch (e) {
+    return { ok:false, err: e?.message || String(e) };
+  }
+}
+
 // -------------------- commands --------------------
 bot.command('ping', (ctx)=>ctx.reply('pong'));
 
-// Teszt parancs: csatornába küldés ellenőrzése
 bot.command('post', async (ctx) => {
   const text = ctx.message.text.split(' ').slice(1).join(' ') || 'Teszt üzenet';
   try {
@@ -298,6 +315,16 @@ bot.command('post', async (ctx) => {
     await ctx.reply(`❌ Nem sikerült: ${e?.description || e?.message}`);
     console.error('sendMessage error:', e);
   }
+});
+
+bot.command('debug', async (ctx) => {
+  const r = await debugFetchBurns(60);
+  if (!r.ok) return ctx.reply(`❌ Bitquery hiba: ${r.err}`);
+  let msg = `🧪 Debug: last 60s\n• Instructions: ${r.nodes}\n• Parsed burns: ${r.burns}`;
+  if (r.preview?.length) {
+    msg += `\n\nMinták:\n` + r.preview.map(b => `- ${b.sig ? b.sig.slice(0,8)+'…' : 'no-sig'} | mint=${b.mint || 'n/a'} | amount=${b.amount ?? 'n/a'}`).join('\n');
+  }
+  return ctx.reply(msg);
 });
 
 // -------------------- start --------------------
