@@ -8,31 +8,30 @@ dotenv.config();
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const channelId = process.env.CHANNEL_ID;
 
-// Bitquery GraphQL API endpoint
-const BITQUERY_URL = "https://graphql.bitquery.io";
+// Bitquery API V2 endpoint
+const BITQUERY_URL = "https://graphql.bitquery.io/v1";
 
 // LP burn események lekérdezése
 async function getBurnEvents() {
   const query = `
     query GetSolanaBurns {
-      solana(network: solana) {
-        transfers(
-          options: {desc: "block.timestamp.time", limit: 5}
-          date: {since: "2025-08-01"}
+      Solana {
+        Transfers(
           transferType: burn
+          options: { desc: "block.timestamp.iso8601", limit: 5 }
         ) {
-          block {
-            timestamp {
-              time(format: "%Y-%m-%d %H:%M:%S")
+          Block {
+            Timestamp {
+              iso8601
             }
           }
-          amount
-          currency {
-            symbol
-            address
+          Amount
+          Currency {
+            Symbol
+            Address
           }
-          sender {
-            address
+          Sender {
+            Address
           }
         }
       }
@@ -46,12 +45,12 @@ async function getBurnEvents() {
       {
         headers: {
           "Content-Type": "application/json",
-          "X-API-KEY": process.env.BITQUERY_API_KEY
+          "Authorization": `Bearer ${process.env.BITQUERY_API_KEY}`
         }
       }
     );
 
-    const burns = response.data?.data?.solana?.transfers || [];
+    const burns = response.data?.data?.Solana?.Transfers || [];
     return burns;
   } catch (error) {
     console.error("[Bot] ❌ Bitquery API hiba:", error.response?.status || error.message);
@@ -81,10 +80,10 @@ async function checkBurns() {
   for (const burn of burns) {
     const msg = `
 🔥 <b>Új LP Burn esemény!</b>
-💰 Token: <b>${burn.currency.symbol}</b>
-💎 Összeg: <b>${burn.amount}</b>
-🕒 Idő: ${burn.block.timestamp.time}
-🔗 Cím: <code>${burn.currency.address}</code>
+💰 Token: <b>${burn.Currency.Symbol}</b>
+💎 Összeg: <b>${burn.Amount}</b>
+🕒 Idő: ${burn.Block.Timestamp.iso8601}
+🔗 Cím: <code>${burn.Currency.Address}</code>
     `;
     await sendTelegramMessage(msg);
   }
