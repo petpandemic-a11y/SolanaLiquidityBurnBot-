@@ -1,134 +1,108 @@
 import axios from "axios";
-import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
+import { Telegraf } from "telegraf";
 
 dotenv.config();
 
 // --- ENV változók ---
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
-const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY || null;
 
-// --- Telegram bot inicializálás ---
-const bot = new TelegramBot(BOT_TOKEN, { polling: false });
+if (!BOT_TOKEN || !CHANNEL_ID) {
+  console.error("[Bot] ❌ BOT_TOKEN vagy CHANNEL_ID hiányzik a .env fájlból!");
+  process.exit(1);
+}
 
-// --- Raydium v3 API ---
-const RAYDIUM_API = "https://api-v3.raydium.io/pools";
+const bot = new Telegraf(BOT_TOKEN);
 
-// --- Jupiter fallback ---
-const JUPITER_API = "https://price.jup.ag/v4/tokens";
+// --- API végpontok ---
+const RAYDIUM_API = "https://api.raydium.io/v2/sdk/liquidity/mainnet.json";
+const JUPITER_API = "https://quote-api.jup.ag/v6/tokens";
 
 // --- Időzítés ---
-const CHECK_INTERVAL = 10000; // 10 mp
+const CHECK_INTERVAL = 15000; // 15 másodpercenként ellenőrzés
 
-// --- LP burn figyelés ---
-let watchedPools = [];
+let pools = [];
+let lastBurns = new Set();
 
-// Raydium poolok lekérése
-async function fetchRaydiumPools() {
+// --- LP poolok betöltése Raydiumról ---
+async function loadPools() {
   try {
-    console.log("[Bot] 🔄 Raydium poolok lekérése...");
-    const { data } = await axios.get(RAYDIUM_API);
+    console.log("[Bot] 🌊 Raydium poolok lekérése...");
+    const res = await axios.get(RAYDIUM_API, { timeout: 15000 });
 
-    if (!data || !data.data) throw new Error("Üres adat a Raydium API-ból");
+    if (!res.data) throw new Error("Üres Raydium API válasz");
 
-    watchedPools = data.data
-      .filter(p => p.lp && p.lp.locked === true)
-      .map(p => ({
-        name: p.name,
-        lpMint: p.lp.mint,
-        contract: p.lp.mint,
-        tvl: p.tvl || 0,
-      }));
+    pools = Object.values(res.data.official ?? {}).concat(Object.values(res.data.unOfficial ?? {}));
 
-    console.log(`[Bot] ✅ ${watchedPools.length} pool figyelve.`);
+    console.log(`[Bot] ✅ Raydium poolok betöltve: ${pools.length} pool.`);
   } catch (err) {
-    console.error("[Bot] Raydium API hiba:", err.message);
-    await fetchJupiterFallback();
+    console.error("[Bot] ❌ Raydium API hiba:", err.message);
+    console.log("[Bot] 🌐 Jupiter fallback indul...");
+    await loadPoolsFromJupiter();
   }
 }
 
-// Jupiter fallback poolok
-async function fetchJupiterFallback() {
+// --- LP poolok betöltése Jupiter fallbackból ---
+async function loadPoolsFromJupiter() {
   try {
-    console.log("[Bot] 🌐 Jupiter fallback indul...");
-    const { data } = await axios.get(JUPITER_API);
-    watchedPools = Object.values(data.data).slice(0, 50);
-    console.log(`[Bot] ✅ Jupiter fallback sikeres: ${watchedPools.length} pool figyelve.`);
+    console.log("[Bot] 🌐 Jupiter poolok lekérése...");
+    const res = await axios.get(JUPITER_API, { timeout: 15000 });
+
+    if (!res.data) throw new Error("Üres Jupiter API válasz");
+
+    pools = res.data;
+    console.log(`[Bot] ✅ Jupiter poolok betöltve: ${pools.length} pool.`);
   } catch (err) {
     console.error("[Bot] ❌ Jupiter API hiba:", err.message);
+    console.log("[Bot] ⚠️ Nem sikerült frissíteni a pool listát.");
   }
 }
 
-// Bitquery lekérés LP burn ellenőrzéshez
-async function fetchBitqueryBurns(pool) {
-  if (!BITQUERY_API_KEY) return null;
-
-  try {
-    const query = `
-      query {
-        solana(network: solana) {
-          transfers(
-            options: {limit: 1, desc: "block.timestamp.iso8601"}
-            amount: {gt: 0}
-            currency: {is: "${pool.lpMint}"}
-            sender: {is: "${pool.lpMint}"}
-          ) {
-            amount
-            block {
-              timestamp {
-                iso8601
-              }
-            }
-            transaction {
-              signature
-            }
-          }
-        }
-      }`;
-
-    const { data } = await axios.post(
-      "https://graphql.bitquery.io",
-      { query },
-      { headers: { "X-API-KEY": BITQUERY_API_KEY } }
-    );
-
-    return data.data.solana.transfers.length > 0
-      ? data.data.solana.transfers[0]
-      : null;
-  } catch (err) {
-    console.error(`[Bot] Bitquery API hiba: ${err.message}`);
-    return null;
-  }
-}
-
-// Esemény ellenőrzés és Telegram posztolás
-async function checkForLpBurns() {
+// --- LP burn események ellenőrzése ---
+async function checkLpBurns() {
   console.log("[Bot] 🔄 Ellenőrzés indul...");
 
-  for (const pool of watchedPools) {
-    const burn = await fetchBitqueryBurns(pool);
+  try {
+    const burnEvents = pools.filter(pool => {
+      // Teszt logika: szűrjük azokat a poolokat, ahol 0 a likviditás
+      return pool.baseReserve === "0" || pool.quoteReserve === "0";
+    });
 
-    if (burn) {
-      const message = `
-🔥 *LP BURN ÉSZLELVE!*
-🪙 Token: *${pool.name}*
-📜 Contract: \`${pool.contract}\`
-💰 Market Cap: $${pool.tvl.toLocaleString()}
-🔗 [Tx link](https://solscan.io/tx/${burn.transaction.signature})
-      `;
-
-      await bot.sendMessage(CHANNEL_ID, message, { parse_mode: "Markdown" });
-      console.log(`[Bot] 🚀 Új LP burn: ${pool.name}`);
+    if (burnEvents.length === 0) {
+      console.log("[Bot] ℹ️ Nincs új LP burn esemény.");
+      return;
     }
+
+    for (const event of burnEvents) {
+      if (lastBurns.has(event.id)) continue;
+      lastBurns.add(event.id);
+
+      const message = `
+🔥 **Új LP Burn esemény!**
+📌 Pool: ${event.name || "Ismeretlen"}
+💧 Token A: ${event.baseMint || "-"}
+💧 Token B: ${event.quoteMint || "-"}
+`;
+
+      await bot.telegram.sendMessage(CHANNEL_ID, message, { parse_mode: "Markdown" });
+      console.log("[Bot] 📢 Új LP burn esemény küldve:", event.name);
+    }
+  } catch (err) {
+    console.error("[Bot] ❌ Hibás LP burn ellenőrzés:", err.message);
   }
 }
 
-// Bot indítás
-async function startBot() {
+// --- Bot indítása ---
+(async () => {
   console.log("[Bot] 🚀 LP Burn Bot indul...");
-  await fetchRaydiumPools();
-  setInterval(checkForLpBurns, CHECK_INTERVAL);
-}
 
-startBot();
+  await loadPools();
+
+  setInterval(async () => {
+    if (pools.length === 0) {
+      await loadPools();
+    }
+    await checkLpBurns();
+  }, CHECK_INTERVAL);
+})();
