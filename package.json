@@ -1,15 +1,31 @@
 {
   "name": "solana-lp-burn-bot",
   "version": "1.0.0",
-  "description": "Telegram bot for monitoring 100% LP burns on Solana using Solscan + Birdeye API",
+  "description": "Telegram bot, amely figyeli a Solana hálózaton az LP burn eseményeket és posztolja a csatornába",
   "main": "SRC/index.js",
-  "type": "module",
   "scripts": {
-    "start": "node SRC/index.js"
+    "start": "node SRC/index.js",
+    "dev": "nodemon SRC/index.js"
   },
   "dependencies": {
-    "axios": "^1.6.8",
-    "dotenv": "^16.3.1",
-    "node-telegram-bot-api": "^0.61.0"
-  }
+    "axios": "^1.7.7",
+    "node-telegram-bot-api": "^0.66.0",
+    "dotenv": "^16.4.5",
+    "chalk": "^5.3.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "solana",
+    "raydium",
+    "jupiter",
+    "lp-burn",
+    "telegram-bot"
+  ],
+  "author": "Peter",
+  "license": "MIT"
 }
