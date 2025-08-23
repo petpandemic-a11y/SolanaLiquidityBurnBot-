@@ -1,232 +1,193 @@
-// ===========================
-// Solana Burn Bot - FINAL
-// ===========================
-
 import fetch from "node-fetch";
-import { Telegraf } from "telegraf";
 import dotenv from "dotenv";
+import { Telegraf } from "telegraf";
 
 dotenv.config();
 
-// === ENV CONFIG ===
+// ====== ENV ======
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
-const MIN_SOL = parseFloat(process.env.MIN_SOL || "0.1");
-const MAX_MCAP_SOL = parseFloat(process.env.MAX_MCAP_SOL || "0");
-const POLL_INTERVAL_SEC = parseInt(process.env.POLL_INTERVAL_SEC || "10");
-const POLL_LOOKBACK_SEC = parseInt(process.env.POLL_LOOKBACK_SEC || "12");
-const DEDUP_MINUTES = parseInt(process.env.DEDUP_MINUTES || "10");
 
-const ADMIN_ID = process.env.ADMIN_ID;
+let MIN_SOL = parseFloat(process.env.MIN_SOL || "0");
+let MAX_MCAP_SOL = parseFloat(process.env.MAX_MCAP_SOL || "0");
+let POLL_INTERVAL_SEC = parseInt(process.env.POLL_INTERVAL_SEC || "10");
+let POLL_LOOKBACK_SEC = parseInt(process.env.POLL_LOOKBACK_SEC || "12");
+let DEDUP_MINUTES = parseInt(process.env.DEDUP_MINUTES || "10");
 
-// === TELEGRAM BOT ===
+let LP_MODE = "relaxed"; // alapértelmezett: relaxed
+
 const bot = new Telegraf(BOT_TOKEN);
 
-// === GLOBAL STATE ===
-let dedupCache = new Map();
-let lpMode = "strict";
-let pollInterval = POLL_INTERVAL_SEC;
+// Dedup cache
+const seenTx = new Map();
 
-// === HELPERS ===
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function getSolUsd() {
-  try {
-    const r = await fetch("https://public-api.birdeye.so/public/price?address=So11111111111111111111111111111111111111112", {
-      headers: { "X-API-KEY": BIRDEYE_API_KEY }
-    });
-    const j = await r.json();
-    return j?.data?.value || null;
-  } catch (e) {
-    console.error("[Birdeye SOL price]", e.message);
-    return null;
-  }
-}
-
+// ========== GET PRICE (BIRDEYE) ==========
 async function getTokenPrice(mint) {
   try {
-    const r = await fetch(`https://public-api.birdeye.so/public/price?address=${mint}`, {
-      headers: { "X-API-KEY": BIRDEYE_API_KEY }
+    const url = `https://public-api.birdeye.so/defi/price?address=${mint}`;
+    const res = await fetch(url, {
+      headers: {
+        "accept": "application/json",
+        "X-API-KEY": BIRDEYE_API_KEY
+      }
     });
-    const j = await r.json();
-    return j?.data?.value || null;
-  } catch {
+    const data = await res.json();
+    return data?.data?.value || null;
+  } catch (e) {
+    console.error(`[birdeye price] fail for ${mint}`, e.message);
     return null;
   }
 }
 
+async function getSolPrice() {
+  return await getTokenPrice("So11111111111111111111111111111111111111112");
+}
+
+// ========== BITQUERY GRAPHQL ==========
 async function fetchBurns() {
   const query = `
-    query {
-      Solana {
-        Instructions(
-          where: { Instruction: { Program: { is: "spl-token" }, Method: { is: "burn" } } }
-          limit: { count: 500 }
-          orderBy: { descending: Block_Time }
-        ) {
-          Transaction {
-            Signature
-          }
-          Instruction {
-            Accounts {
-              Account
-            }
-            Data {
-              Parsed {
-                Info {
-                  Amount
-                }
-              }
-            }
-          }
-          Block {
-            Time
-          }
+  query {
+    Solana {
+      TokenSupplyUpdates(
+        where: {
+          Instruction: { Program: { Method: { is: "burn" }}},
+          Block: { Time: { since: "${new Date(Date.now() - POLL_LOOKBACK_SEC * 1000).toISOString()}" }}
+        }
+        limit: { count: 500 }
+      ) {
+        Transaction {
+          Signature
+        }
+        Currency {
+          Mint
+        }
+        Amount
+      }
+    }
+  }`;
+
+  const res = await fetch("https://streaming.bitquery.io/eap", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": BITQUERY_API_KEY
+    },
+    body: JSON.stringify({ query })
+  });
+
+  const json = await res.json();
+  return json?.data?.Solana?.TokenSupplyUpdates || [];
+}
+
+// ========== FORMAT NUMBER ==========
+function formatSol(sol) {
+  return parseFloat(sol).toFixed(4);
+}
+
+// ========== TELEGRAM POST ==========
+async function postBurn(burn) {
+  const { sig, mint, burnSol, priceUsd, mcapUsd, liqUsd } = burn;
+
+  const solPrice = await getSolPrice();
+  const burnInSol = burnSol;
+  const priceInSol = priceUsd && solPrice ? priceUsd / solPrice : null;
+  const mcapInSol = mcapUsd && solPrice ? mcapUsd / solPrice : null;
+
+  let txt = `🔥 **Token Burn Detected**\n\n`;
+  txt += `**Token:** \`${mint}\`\n`;
+  txt += `**Burned:** ${formatSol(burnInSol)} SOL\n`;
+  txt += `**Price:** ${priceInSol ? formatSol(priceInSol) + " SOL" : "n/a"}\n`;
+  txt += `**Marketcap:** ${mcapInSol ? formatSol(mcapInSol) + " SOL" : "n/a"}\n`;
+  txt += `**Liquidity:** ${liqUsd === 0 ? "💧 0 (LP burned)" : "n/a"}\n\n`;
+  txt += `[🔎 Solscan](https://solscan.io/tx/${sig}) | [📊 Birdeye](https://birdeye.so/token/${mint})`;
+
+  await bot.telegram.sendMessage(CHANNEL_ID, txt, { parse_mode: "Markdown", disable_web_page_preview: true });
+}
+
+// ========== POLLING LOOP ==========
+async function poll() {
+  try {
+    const burns = await fetchBurns();
+
+    for (const b of burns) {
+      const sig = b.Transaction.Signature;
+      const mint = b.Currency.Mint;
+      const amount = Math.abs(parseFloat(b.Amount));
+
+      // Dedup
+      if (seenTx.has(sig)) continue;
+      seenTx.set(sig, Date.now());
+      setTimeout(() => seenTx.delete(sig), DEDUP_MINUTES * 60 * 1000);
+
+      const solPrice = await getSolPrice();
+      const burnSol = solPrice ? amount * solPrice : amount;
+
+      if (burnSol < MIN_SOL) {
+        console.log(`[SKIP < MIN_SOL] sig=${sig} burnSol=${burnSol}`);
+        continue;
+      }
+
+      // Ha van mcap limit
+      if (MAX_MCAP_SOL > 0 && b.mcapUsd && solPrice) {
+        const mcapInSol = b.mcapUsd / solPrice;
+        if (mcapInSol > MAX_MCAP_SOL) {
+          console.log(`[SKIP > MAX_MCAP] sig=${sig} mcapSol=${mcapInSol}`);
+          continue;
         }
       }
-    }`;
-  try {
-    const r = await fetch("https://streaming.bitquery.io/eap", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": BITQUERY_API_KEY
-      },
-      body: JSON.stringify({ query })
-    });
-    const j = await r.json();
-    return j.data?.Solana?.Instructions || [];
+
+      // LP filter
+      if (LP_MODE === "strict" && b.liqUsd && b.liqUsd > 0) {
+        console.log(`[SKIP LP not fully burned] sig=${sig}`);
+        continue;
+      }
+
+      await postBurn({ sig, mint, burnSol: amount, priceUsd: b.priceUsd, mcapUsd: b.mcapUsd, liqUsd: b.liqUsd });
+    }
+
+    console.log(`[POLL] parsed ${burns.length}`);
   } catch (e) {
-    console.error("[Bitquery] fetch error:", e.message);
-    return [];
+    console.error("[poll error]", e.message);
   }
 }
 
-function shouldSkip(sig) {
-  const last = dedupCache.get(sig);
-  const now = Date.now();
-  if (last && now - last < DEDUP_MINUTES * 60_000) return true;
-  dedupCache.set(sig, now);
-  return false;
-}
-
-async function postBurn(burn) {
-  const {
-    sig,
-    mint,
-    burnSol,
-    priceUsd,
-    mcapSol,
-    liqUsd
-  } = burn;
-
-  if (burnSol < MIN_SOL) return;
-  if (MAX_MCAP_SOL > 0 && mcapSol && mcapSol > MAX_MCAP_SOL) return;
-  if (lpMode === "strict" && liqUsd !== 0) return;
-
-  const tokenPrice = priceUsd ? `${(priceUsd).toFixed(6)} USD` : "n/a";
-  const burnSolFmt = `${burnSol.toFixed(4)} ◎`;
-  const mcapFmt = mcapSol ? `${mcapSol.toFixed(2)} ◎` : "n/a";
-  const liqFmt = liqUsd !== undefined ? `${liqUsd}` : "n/a";
-
-  const text = `🔥 **TOKEN BURN DETECTED** 🔥
-━━━━━━━━━━━━━━━━━━━━━━
-**Token:** [${mint}](https://solscan.io/token/${mint})
-**Amount burned:** ${burnSolFmt}
-**Price:** ${tokenPrice}
-**Marketcap:** ${mcapFmt}
-**Liquidity:** ${liqFmt}
-━━━━━━━━━━━━━━━━━━━━━━
-[Solscan](https://solscan.io/tx/${sig}) | [Birdeye](https://birdeye.so/token/${mint}) | [DexScreener](https://dexscreener.com/solana/${mint})`;
-
-  await bot.telegram.sendMessage(CHANNEL_ID, text, {
-    parse_mode: "Markdown",
-    disable_web_page_preview: true
-  });
-}
-
-// === POLLING ===
-async function poll() {
-  console.log("[POLL] start", new Date().toISOString());
-  const burns = await fetchBurns();
-  const solUsd = await getSolUsd();
-
-  for (const b of burns) {
-    const sig = b.Transaction.Signature;
-    if (shouldSkip(sig)) continue;
-
-    const mint = b.Instruction.Accounts[0]?.Account || "unknown";
-    const amount = parseFloat(b.Instruction.Data.Parsed.Info.Amount || "0");
-    const priceUsd = await getTokenPrice(mint);
-    const burnSol = priceUsd && solUsd ? amount * priceUsd / solUsd : 0;
-
-    await postBurn({
-      sig,
-      mint,
-      burnSol,
-      priceUsd,
-      mcapSol: null,
-      liqUsd: 0
-    });
-  }
-}
-
-// === HEARTBEAT ===
+// ========== HEARTBEAT ==========
 setInterval(() => {
-  console.log("[HEARTBEAT]", new Date().toISOString());
-}, 15_000);
+  console.log(`[HEARTBEAT] ${new Date().toISOString()}`);
+}, 15000);
 
-// === COMMANDS ===
-bot.command("ping", (ctx) => ctx.reply("pong"));
-bot.command("status", (ctx) =>
-  ctx.reply(`MIN_SOL=${MIN_SOL} ◎\nMAX_MCAP_SOL=${MAX_MCAP_SOL}\nLP Mode=${lpMode}\nInterval=${pollInterval}s`)
-);
-bot.command("setminsol", (ctx) => {
-  if (ctx.from.id.toString() !== ADMIN_ID) return;
+// ========== LOOP ==========
+setInterval(poll, POLL_INTERVAL_SEC * 1000);
+
+// ========== BOT COMMANDS ==========
+bot.command("ping", ctx => ctx.reply("pong"));
+bot.command("status", ctx => {
+  ctx.reply(`⚙️ **Config:**\nMIN_SOL=${MIN_SOL} SOL\nMAX_MCAP_SOL=${MAX_MCAP_SOL} SOL\nLP_MODE=${LP_MODE}\nInterval=${POLL_INTERVAL_SEC}s`, { parse_mode: "Markdown" });
+});
+bot.command("setminsol", ctx => {
   const val = parseFloat(ctx.message.text.split(" ")[1]);
   if (!isNaN(val)) {
-    process.env.MIN_SOL = val;
-    ctx.reply(`✅ MIN_SOL updated: ${val} ◎`);
+    MIN_SOL = val;
+    ctx.reply(`✅ MIN_SOL updated to ${MIN_SOL}`);
   }
 });
-bot.command("setmaxmcap", (ctx) => {
-  if (ctx.from.id.toString() !== ADMIN_ID) return;
+bot.command("setmaxmcap", ctx => {
   const val = parseFloat(ctx.message.text.split(" ")[1]);
   if (!isNaN(val)) {
-    process.env.MAX_MCAP_SOL = val;
-    ctx.reply(`✅ MAX_MCAP_SOL updated: ${val} ◎`);
+    MAX_MCAP_SOL = val;
+    ctx.reply(`✅ MAX_MCAP_SOL updated to ${MAX_MCAP_SOL}`);
   }
 });
-bot.command("setlp", (ctx) => {
-  if (ctx.from.id.toString() !== ADMIN_ID) return;
+bot.command("setlp", ctx => {
   const mode = ctx.message.text.split(" ")[1];
-  if (mode === "strict" || mode === "relaxed") {
-    lpMode = mode;
-    ctx.reply(`✅ LP mode: ${mode}`);
+  if (["strict", "relaxed"].includes(mode)) {
+    LP_MODE = mode;
+    ctx.reply(`✅ LP_MODE set to ${LP_MODE}`);
   }
 });
-bot.command("setinterval", (ctx) => {
-  if (ctx.from.id.toString() !== ADMIN_ID) return;
-  const val = parseInt(ctx.message.text.split(" ")[1]);
-  if (!isNaN(val) && val >= 5) {
-    pollInterval = val;
-    ctx.reply(`✅ Interval updated: ${val}s`);
-  }
-});
-bot.command("debugpoll", async (ctx) => {
-  if (ctx.from.id.toString() !== ADMIN_ID) return;
-  ctx.reply("🔄 Manual poll...");
-  await poll();
-  ctx.reply("✅ Done!");
-});
 
-// === START ===
-(async () => {
-  await bot.launch();
-  console.log("[BOT] started");
-
-  // Start polling loop
-  setInterval(poll, pollInterval * 1000);
-})();
+// ========== START ==========
+bot.launch();
+console.log("🚀 Bot started...");
