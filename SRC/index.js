@@ -7,76 +7,60 @@ const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
 const CHANNEL_ID = process.env.CHANNEL_ID;
 const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
 
-// Solscan API LP burn eseményekhez
-const SOLSCAN_API = "https://public-api.solscan.io/account/tokens";
-const BIRDEYE_API = "https://public-api.birdeye.so/public/token";
-
-// Token infók lekérése Birdeye API-ról (price, mcap, holders)
+// Birdeye API token info lekérés (ár, mcap, holders)
 async function fetchTokenInfo(tokenAddress) {
   try {
-    const res = await axios.get(`${BIRDEYE_API}?address=${tokenAddress}`, {
+    const res = await axios.get(`https://public-api.birdeye.so/public/token?address=${tokenAddress}`, {
       headers: { "X-API-KEY": BIRDEYE_API_KEY },
     });
-    const data = res.data.data;
+
+    const data = res.data?.data || {};
     return {
-      price: data.price || null,
-      mcap: data.mc || null,
-      holders: data.holder || null,
+      price: data.price || 0,
+      mcap: data.mc || 0,
+      holders: data.holder || 0,
+      symbol: data.symbol || "N/A",
+      name: data.name || "Unknown",
     };
   } catch (e) {
-    console.error("Token info lekérés hiba:", e.message);
-    return { price: null, mcap: null, holders: null };
+    console.error("Token info hiba:", e.message);
+    return {};
   }
 }
 
-// LP burn események ellenőrzése Solscan API-n keresztül
+// DexScreener API – legfrissebb Solana tranzakciók
 async function fetchBurnEvents() {
   try {
-    // Lekérjük a legutóbbi tranzakciókat az LP poolokból
-    const res = await axios.get(
-      "https://public-api.solscan.io/transaction?limit=20"
-    );
-    const txs = res.data || [];
+    const res = await axios.get("https://api.dexscreener.com/latest/dex/tokens/solana");
+    const pairs = res.data?.pairs || [];
 
-    for (const tx of txs) {
-      if (!tx.tokenTransfers) continue;
+    for (const pair of pairs) {
+      const tokenAddress = pair.baseToken.address;
+      const tokenSymbol = pair.baseToken.symbol;
+      const liquidityUSD = pair.liquidity?.usd || 0;
 
-      for (const transfer of tx.tokenTransfers) {
-        // Csak burn tranzakciók
-        if (
-          transfer.destination &&
-          transfer.destination === "11111111111111111111111111111111" // Solana burn address
-        ) {
-          const tokenAddress = transfer.mint;
-          const burnedAmount = Number(transfer.amount);
+      // Ha LP likviditás = 0 → teljes LP burn
+      if (liquidityUSD === 0) {
+        const tokenInfo = await fetchTokenInfo(tokenAddress);
 
-          // Ellenőrizzük az LP teljes mennyiségét
-          const tokenInfo = await fetchTokenInfo(tokenAddress);
-          if (!tokenInfo || !tokenInfo.mcap || burnedAmount <= 0) continue;
-
-          // Ha az LP teljesen elégett
-          if (burnedAmount >= transfer.amount) {
-            const msg = `
+        const msg = `
 🔥 *100% LP Burn Detected!* 🔥
 
-💎 *Token:* ${transfer.tokenSymbol || "Unknown"}
+💎 *Token:* ${tokenInfo.name} (${tokenSymbol})
 📜 *Contract:* \`${tokenAddress}\`
-💰 *Price:* $${tokenInfo.price ? tokenInfo.price.toFixed(6) : "N/A"}
+💰 *Price:* $${tokenInfo.price.toFixed(6)}
 📈 *Market Cap:* $${tokenInfo.mcap ? tokenInfo.mcap.toLocaleString() : "N/A"}
 👥 *Holders:* ${tokenInfo.holders || "N/A"}
-🔥 *Amount Burned:* ${burnedAmount.toLocaleString()}
-🔗 [View Transaction](https://solscan.io/tx/${tx.txHash})
-            `;
+🔗 [View on DexScreener](https://dexscreener.com/solana/${tokenAddress})
+        `;
 
-            await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
-          }
-        }
+        await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
       }
     }
   } catch (e) {
-    console.error("LP burn lekérés hiba:", e.message);
+    console.error("Burn lekérés hiba:", e.message);
   }
 }
 
-// 10 másodpercenként ellenőrizzük
+// 10 másodpercenként figyelünk
 setInterval(fetchBurnEvents, 10000);
