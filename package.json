@@ -1,15 +1,15 @@
 {
   "name": "solana-lp-burn-bot",
   "version": "1.0.0",
-  "description": "Telegram bot for monitoring 100% LP burns on Solana via Bitquery API",
+  "description": "Telegram bot for monitoring 100% LP burns on Solana using Solscan + Birdeye API",
   "main": "SRC/index.js",
   "type": "module",
   "scripts": {
     "start": "node SRC/index.js"
   },
   "dependencies": {
+    "axios": "^1.6.8",
     "dotenv": "^16.3.1",
-    "node-fetch": "^3.3.2",
     "node-telegram-bot-api": "^0.61.0"
   }
 }
