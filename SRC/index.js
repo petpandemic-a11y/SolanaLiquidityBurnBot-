@@ -511,4 +511,11 @@ bot.command("setmaxmcap", function(ctx){
       "Price: Birdeye"
     ].join("\n");
     await bot.telegram.sendMessage(CHANNEL_ID, boot);
-  }catch(e){ console.error("[startup send error]", e && e.mes
+  }catch(e){ console.error("[startup send error]", e && e.message ? e.message : e); }
+
+  await pollOnce();
+  restartPolling();
+})();
+
+process.once("SIGINT", function(){ bot.stop("SIGINT"); });
+process.once("SIGTERM", function(){ bot.stop("SIGTERM"); });
