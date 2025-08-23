@@ -6,20 +6,24 @@ dotenv.config();
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
-// Új, stabil DexScreener Solana végpont
-const DEXSCREENER_API = "https://api.dexscreener.com/latest/dex/pairs/solana";
+// Új univerzális DexScreener API
+const DEXSCREENER_API = "https://api.dexscreener.com/latest/dex/pairs";
 
 async function fetchBurnEvents() {
   console.log("🔄 Ellenőrzés indul...");
 
   try {
-    const res = await axios.get(DEXSCREENER_API, { timeout: 15000 });
+    // Lekérjük az összes elérhető párt
+    const res = await axios.get(DEXSCREENER_API, { timeout: 20000 });
     const pairs = res.data?.pairs || [];
 
-    for (const pair of pairs) {
+    // Csak Solana hálózatot nézünk
+    const solanaPairs = pairs.filter(pair => pair.chainId === "solana");
+
+    for (const pair of solanaPairs) {
       const liquidityUSD = pair.liquidity?.usd || 0;
 
-      // Ha LP likviditás = 0 → teljes LP burn
+      // Ha LP = 0 → teljes LP burn
       if (liquidityUSD === 0) {
         const msg = `
 🔥 *100% LP Burn Detected!* 🔥
