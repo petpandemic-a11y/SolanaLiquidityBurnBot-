@@ -486,15 +486,14 @@ bot.command('force', async (ctx) => {
     return ctx.reply(`❌ Force (simple) error: ${e?.description || e?.message || String(e)}`);
   }
 });
-
-// FORCEBURN: Bitquery-based forced post
+// FORCEBURN: Bitquery-based forced post (fixed, no emojis)
 bot.command('forceburn', async (ctx) => {
-  if (!isAdmin(ctx)) return ctx.reply('❌ No permission.');
+  if (!isAdmin(ctx)) return ctx.reply('No permission.');
   try {
     const json = await bitqueryFetch(GQL(30));
     const nodes = json?.data?.Solana?.TokenSupplyUpdates || [];
     const burns = parseBurnNodes(nodes);
-    if (!burns.length) return ctx.reply('ℹ️ No recent burns (last 30s).');
+    if (!burns.length) return ctx.reply('No recent burns (last 30s).');
 
     const b = burns.find(x => x.mint && typeof x.amount === 'number' && x.amount > 0) || burns[0];
 
@@ -509,8 +508,12 @@ bot.command('forceburn', async (ctx) => {
       `sig=${b.sig || 'n/a'}`,
       `mint=${b.mint || 'n/a'}`,
       `amount=${b.amount ?? 'n/a'}`,
-      `usd≈${usd ?? 'n/a'}`
+      `usd~${usd ?? 'n/a'}`
     ].join('\n');
 
     await bot.telegram.sendMessage(CHANNEL_ID, msg, { disable_web_page_preview: true });
-    return ctx.reply('✅ Forceburn s
+    return ctx.reply('Forceburn sent to channel.');
+  } catch (e) {
+    return ctx.reply(`Forceburn error: ${e?.message || String(e)}`);
+  }
+});
