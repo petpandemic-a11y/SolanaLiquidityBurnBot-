@@ -1,115 +1,66 @@
 import express from "express";
-import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
-import axios from "axios";
+import TelegramBot from "node-telegram-bot-api";
 
 dotenv.config();
-
 const app = express();
-app.use(express.json());
+const port = process.env.PORT || 10000;
 
+// Telegram bot inicializálás
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
 
-// Burn címek
-const BURN_ADDRESSES = [
-  "11111111111111111111111111111111",
-  "1nc1nerator11111111111111111111111111111",
-  "Burn11111111111111111111111111111111111"
-];
+// Bejövő JSON feldolgozása
+app.use(express.json());
 
-// Helius RPC endpoint
-const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`;
-
-// Token meta + supply lekérése Helius RPC-ből
-async function getTokenInfo(mintAddress) {
-  try {
-    const response = await axios.post(HELIUS_RPC, {
-      jsonrpc: "2.0",
-      id: "burn-bot",
-      method: "getAsset",
-      params: { id: mintAddress }
-    });
-
-    const token = response.data?.result;
-    if (!token) return { name: mintAddress, decimals: 0, supply: 0 };
-
-    return {
-      name: token.content?.metadata?.name || mintAddress,
-      decimals: token.token_info?.decimals || 0,
-      supply: parseInt(token.token_info?.supply || 0)
-    };
-  } catch (err) {
-    console.error("❌ Token info lekérési hiba:", err.message);
-    return { name: mintAddress, decimals: 0, supply: 0 };
-  }
-}
+// Teszt endpoint
+app.get("/", (req, res) => {
+  res.send("✅ Solana LP Burn Bot él!");
+});
 
 // Webhook endpoint
 app.post("/webhook", async (req, res) => {
   try {
-    const data = req.body;
+    console.log("=== ÚJ WEBHOOK ÉRKEZETT ===");
+    console.log(JSON.stringify(req.body, null, 2)); // teljes Helius payload logolása
 
-    if (!Array.isArray(data)) {
-      console.log("⚠️ Üres webhook érkezett");
+    const events = req.body?.events || [];
+    if (!events.length) {
+      console.log("⚠️ Nincsenek események ebben a webhookban.");
       return res.status(200).send("OK");
     }
 
-    for (const tx of data) {
-      const instructions = tx.instructions || [];
+    for (const event of events) {
+      const tx = event.signature || "Ismeretlen";
+      const token = event.tokenTransfers?.[0]?.mint || "Ismeretlen token";
+      const amount = event.tokenTransfers?.[0]?.amount || "Ismeretlen mennyiség";
 
-      for (const ix of instructions) {
-        const destination = ix.parsed?.info?.destination;
-        const mint = ix.parsed?.info?.mint || ix.parsed?.info?.tokenAddress;
+      // Ellenőrzés: csak LP burn címekre figyelünk
+      const toAddr = event.tokenTransfers?.[0]?.toUserAccount || "";
+      const burnAddresses = [
+        "11111111111111111111111111111111",
+        "Burn1111111111111111111111111111111111111",
+        "DEAD111111111111111111111111111111111111"
+      ];
 
-        if (destination && BURN_ADDRESSES.includes(destination) && mint) {
-          const tokenInfo = await getTokenInfo(mint);
+      if (burnAddresses.includes(toAddr)) {
+        const msg = `🔥 **LP BURN ÉSZLELVE** 🔥\n\n` +
+                    `🔹 Token: ${token}\n` +
+                    `🔹 Összeg: ${amount}\n` +
+                    `🔹 Tx: https://solscan.io/tx/${tx}`;
 
-          let rawAmount = ix.parsed?.info?.amount
-            || ix.parsed?.info?.tokenAmount?.uiAmount
-            || ix.parsed?.info?.tokenAmount?.amount
-            || 0;
-
-          // Decimális formázás
-          const amount = tokenInfo.decimals > 0
-            ? parseFloat(rawAmount) / Math.pow(10, tokenInfo.decimals)
-            : parseFloat(rawAmount);
-
-          // Csak akkor posztolunk, ha a burn az LP teljes supply-ja
-          if (tokenInfo.supply > 0 && Math.abs(amount - tokenInfo.supply) < 1) {
-            const message = `
-🔥 *100% LP BURN ÉSZLELVE!* 🔥
-
-Token: ${tokenInfo.name}
-Összeg: ${amount}
-Teljes Supply: ${tokenInfo.supply}
-Tx: https://solscan.io/tx/${tx.signature}
-            `;
-
-            await bot.sendMessage(process.env.CHANNEL_ID, message, {
-              parse_mode: "Markdown"
-            });
-
-            console.log(`✅ 100% LP Burn posztolva: ${tx.signature}`);
-          } else {
-            console.log(`ℹ️ Részleges burn kihagyva: ${tokenInfo.name}`);
-          }
-        }
+        console.log("📤 Telegram üzenet:", msg);
+        await bot.sendMessage(process.env.CHANNEL_ID, msg, { parse_mode: "Markdown" });
       }
     }
 
     res.status(200).send("OK");
   } catch (error) {
     console.error("❌ Webhook feldolgozási hiba:", error);
-    res.status(500).send("Error");
+    res.status(500).send("Hiba");
   }
 });
 
-// Egyszerű státusz ellenőrző endpoint
-app.get("/", (req, res) => {
-  res.send("✅ Solana LP Burn Bot fut!");
-});
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`🚀 Webhook szerver fut a ${PORT}-es porton`);
+// Indítás
+app.listen(port, () => {
+  console.log(`🚀 Webhook szerver fut a ${port}-es porton`);
 });
