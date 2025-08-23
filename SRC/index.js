@@ -1,174 +1,134 @@
 import axios from "axios";
-import chalk from "chalk";
-import dotenv from "dotenv";
 import TelegramBot from "node-telegram-bot-api";
+import dotenv from "dotenv";
 
 dotenv.config();
 
-// === TELEGRAM BOT ===
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
+// --- ENV változók ---
+const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
+const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY || null;
 
-// === API VÉGPONTOK ===
-const RAYDIUM_API = "https://api.raydium.io/v2/sdk/liquidity/mainnet.json"; // ÚJ ✅
-const ORCA_API = "https://api.orca.so/allPools";
-const JUPITER_API = "https://tokens.jup.ag/tokens";
-const BITQUERY_API = "https://graphql.bitquery.io";
+// --- Telegram bot inicializálás ---
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
-// === BITQUERY KULCS ===
-const BITQUERY_KEY = process.env.BITQUERY_API_KEY;
+// --- Raydium v3 API ---
+const RAYDIUM_API = "https://api-v3.raydium.io/pools";
 
-// === KONFIG ===
+// --- Jupiter fallback ---
+const JUPITER_API = "https://price.jup.ag/v4/tokens";
+
+// --- Időzítés ---
 const CHECK_INTERVAL = 10000; // 10 mp
-let lastBurns = new Set();
 
-// === LOG FUNKCIÓ ===
-const log = (msg, type = "info") => {
-  const colors = { info: chalk.cyan, success: chalk.green, error: chalk.red, warn: chalk.yellow };
-  console.log(colors[type](`[Bot] ${msg}`));
-};
+// --- LP burn figyelés ---
+let watchedPools = [];
 
-// === LIQUIDITY POOL LISTA ===
-async function getLiquidityPools() {
+// Raydium poolok lekérése
+async function fetchRaydiumPools() {
   try {
-    log("Raydium poolok lekérése...", "info");
-    const { data } = await axios.get(RAYDIUM_API, { timeout: 15000 });
+    console.log("[Bot] 🔄 Raydium poolok lekérése...");
+    const { data } = await axios.get(RAYDIUM_API);
 
-    if (data && data.official) {
-      const pools = Object.values(data.official);
-      log(`✅ Raydium poolok száma: ${pools.length}`, "success");
-      return pools;
-    } else {
-      log("⚠️ Raydium nem adott adatot, Orca fallback indul...", "warn");
-      return getOrcaPools();
-    }
+    if (!data || !data.data) throw new Error("Üres adat a Raydium API-ból");
+
+    watchedPools = data.data
+      .filter(p => p.lp && p.lp.locked === true)
+      .map(p => ({
+        name: p.name,
+        lpMint: p.lp.mint,
+        contract: p.lp.mint,
+        tvl: p.tvl || 0,
+      }));
+
+    console.log(`[Bot] ✅ ${watchedPools.length} pool figyelve.`);
   } catch (err) {
-    log("❌ Raydium API hiba, Orca fallback indul...", "error");
-    return getOrcaPools();
+    console.error("[Bot] Raydium API hiba:", err.message);
+    await fetchJupiterFallback();
   }
 }
 
-// === ORCA POOL FALLBACK ===
-async function getOrcaPools() {
+// Jupiter fallback poolok
+async function fetchJupiterFallback() {
   try {
-    const { data } = await axios.get(ORCA_API, { timeout: 10000 });
-    const pools = Object.values(data);
-    log(`✅ Orca poolok száma: ${pools.length}`, "success");
-    return pools;
-  } catch {
-    log("❌ Orca API hiba, Jupiter fallback indul...", "error");
-    return getJupiterPools();
+    console.log("[Bot] 🌐 Jupiter fallback indul...");
+    const { data } = await axios.get(JUPITER_API);
+    watchedPools = Object.values(data.data).slice(0, 50);
+    console.log(`[Bot] ✅ Jupiter fallback sikeres: ${watchedPools.length} pool figyelve.`);
+  } catch (err) {
+    console.error("[Bot] ❌ Jupiter API hiba:", err.message);
   }
 }
 
-// === JUPITER POOL FALLBACK ===
-async function getJupiterPools() {
-  try {
-    const { data } = await axios.get(JUPITER_API, { timeout: 10000 });
-    log(`✅ Jupiter tokenek száma: ${data.length}`, "success");
-    return data;
-  } catch {
-    log("❌ Jupiter API sem elérhető!", "error");
-    return [];
-  }
-}
+// Bitquery lekérés LP burn ellenőrzéshez
+async function fetchBitqueryBurns(pool) {
+  if (!BITQUERY_API_KEY) return null;
 
-// === BITQUERY LP BURN ELLENŐRZÉS ===
-async function checkLpBurn(lpMint) {
   try {
-    const query = {
-      query: `
-        query {
-          solana {
-            transfers(
-              options: {limit: 1, desc: "block.timestamp.time"}
-              where: {
-                transferType: {is: burn}
-                currency: {is: "${lpMint}"}
+    const query = `
+      query {
+        solana(network: solana) {
+          transfers(
+            options: {limit: 1, desc: "block.timestamp.iso8601"}
+            amount: {gt: 0}
+            currency: {is: "${pool.lpMint}"}
+            sender: {is: "${pool.lpMint}"}
+          ) {
+            amount
+            block {
+              timestamp {
+                iso8601
               }
-            ) {
-              amount
-              block { timestamp { time } }
+            }
+            transaction {
+              signature
             }
           }
-        }`,
-    };
+        }
+      }`;
 
-    const res = await axios.post(BITQUERY_API, query, {
-      headers: {
-        "Content-Type": "application/json",
-        "X-API-KEY": BITQUERY_KEY,
-      },
-    });
+    const { data } = await axios.post(
+      "https://graphql.bitquery.io",
+      { query },
+      { headers: { "X-API-KEY": BITQUERY_API_KEY } }
+    );
 
-    return res.data?.data?.solana?.transfers?.length > 0;
-  } catch {
-    return false;
-  }
-}
-
-// === BURN ESEMÉNYEK KERESÉSE ===
-async function getBurnEvents(pools) {
-  const burns = [];
-
-  for (const pool of pools) {
-    const lpMint = pool.lpMint || pool.lp_mint || pool.mint;
-    if (!lpMint) continue;
-
-    const lpSupply = Number(pool.lpSupply || pool.lp_supply || 0);
-
-    // Ha nullázva van → ellenőrizzük Bitquery-vel is
-    if (lpSupply === 0 && !lastBurns.has(lpMint)) {
-      const isBurned = await checkLpBurn(lpMint);
-      if (isBurned) {
-        burns.push(pool);
-        lastBurns.add(lpMint);
-      }
-    }
-  }
-  return burns;
-}
-
-// === TELEGRAM ÜZENET KÜLDÉSE ===
-async function sendTelegramMessage(pool) {
-  const msg = `
-🔥 *Új LP Burn esemény!* 🔥
-💎 Token: ${pool.name || "Ismeretlen"}
-📜 Contract: \`${pool.lpMint}\`
-💰 MarketCap: ${pool.price ? `$${pool.price}` : "N/A"}
-🌊 Likviditás: ${pool.liquidity || "N/A"}
-`;
-
-  try {
-    await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
-    log(`📢 Telegram üzenet küldve: ${pool.name || pool.lpMint}`, "success");
+    return data.data.solana.transfers.length > 0
+      ? data.data.solana.transfers[0]
+      : null;
   } catch (err) {
-    log(`❌ Telegram API hiba: ${err.message}`, "error");
+    console.error(`[Bot] Bitquery API hiba: ${err.message}`);
+    return null;
   }
 }
 
-// === FŐ CIKLUS ===
-async function checkBurns() {
-  log("🔄 Ellenőrzés indul...", "info");
+// Esemény ellenőrzés és Telegram posztolás
+async function checkForLpBurns() {
+  console.log("[Bot] 🔄 Ellenőrzés indul...");
 
-  const pools = await getLiquidityPools();
-  if (!pools || pools.length === 0) {
-    log("⚠️ Nem sikerült pool adatot lekérni.", "warn");
-    return;
-  }
+  for (const pool of watchedPools) {
+    const burn = await fetchBitqueryBurns(pool);
 
-  const burns = await getBurnEvents(pools);
+    if (burn) {
+      const message = `
+🔥 *LP BURN ÉSZLELVE!*
+🪙 Token: *${pool.name}*
+📜 Contract: \`${pool.contract}\`
+💰 Market Cap: $${pool.tvl.toLocaleString()}
+🔗 [Tx link](https://solscan.io/tx/${burn.transaction.signature})
+      `;
 
-  if (burns.length > 0) {
-    log(`🔥 ${burns.length} új LP burn esemény!`, "success");
-    for (const burn of burns) {
-      await sendTelegramMessage(burn);
+      await bot.sendMessage(CHANNEL_ID, message, { parse_mode: "Markdown" });
+      console.log(`[Bot] 🚀 Új LP burn: ${pool.name}`);
     }
-  } else {
-    log("ℹ️ Nincs új LP burn esemény.", "info");
   }
 }
 
-// === BOT INDÍTÁSA ===
-log("🚀 LP Burn Bot indul...", "info");
-setInterval(checkBurns, CHECK_INTERVAL);
+// Bot indítás
+async function startBot() {
+  console.log("[Bot] 🚀 LP Burn Bot indul...");
+  await fetchRaydiumPools();
+  setInterval(checkForLpBurns, CHECK_INTERVAL);
+}
+
+startBot();
