@@ -1,66 +1,48 @@
 import express from "express";
 import bodyParser from "body-parser";
-import fetch from "node-fetch";
-import dotenv from "dotenv";
 import TelegramBot from "node-telegram-bot-api";
+import dotenv from "dotenv";
 
 dotenv.config();
 
 const app = express();
 app.use(bodyParser.json());
 
-const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN;
-const TELEGRAM_CHANNEL_ID = process.env.CHANNEL_ID;
-const HELIUS_RPC = process.env.HELIUS_RPC_URL;
+// Telegram bot inicializálás
+const bot = new TelegramBot(process.env.BOT_TOKEN);
 
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
-
+// Webhook endpoint a Helius számára
 app.post("/webhook", async (req, res) => {
-  try {
-    const data = req.body;
-    if (!data || !data[0]) return res.sendStatus(200);
+    console.log("📩 Webhook esemény érkezett:", JSON.stringify(req.body, null, 2));
 
-    const tx = data[0];
-    if (tx.type !== "BURN") return res.sendStatus(200);
+    try {
+        const events = req.body;
 
-    const tokenMint = tx.tokenTransfers?.[0]?.mint;
-    const amountBurned = tx.tokenTransfers?.[0]?.tokenAmount || 0;
-    const owner = tx.tokenTransfers?.[0]?.fromUserAccount;
+        if (events && Array.isArray(events)) {
+            for (const event of events) {
+                if (event.type === "BURN") {
+                    const signature = event.signature;
+                    const amount = event.amount || "Ismeretlen";
+                    const token = event.tokenSymbol || "Ismeretlen token";
 
-    // Lekérdezzük az aktuális LP egyenleget
-    const balanceResponse = await fetch(HELIUS_RPC, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "getTokenSupply",
-        params: [tokenMint]
-      }),
-    });
+                    const message = `🔥 **LP BURN ÉSZLELVE** 🔥\n\nToken: ${token}\nÖsszeg: ${amount}\nTx: https://solscan.io/tx/${signature}`;
 
-    const balanceData = await balanceResponse.json();
-    const remaining = balanceData?.result?.value?.uiAmount || 0;
+                    await bot.sendMessage(process.env.CHANNEL_ID, message, {
+                        parse_mode: "Markdown",
+                    });
+                }
+            }
+        }
 
-    // Csak akkor posztolunk, ha a teljes LP elégett
-    if (remaining === 0) {
-      const msg = `🔥 **LP BURN ÉSZLELVE** 🔥
-      
-Token: \`${tokenMint}\`
-Elégetett mennyiség: ${amountBurned}
-Burn cím: ${owner}
-Tx: https://solscan.io/tx/${tx.signature}`;
-
-      await bot.sendMessage(TELEGRAM_CHANNEL_ID, msg, { parse_mode: "Markdown" });
+        res.sendStatus(200);
+    } catch (error) {
+        console.error("❌ Hiba a webhook feldolgozásakor:", error);
+        res.sendStatus(500);
     }
-
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook hiba:", err);
-    res.sendStatus(500);
-  }
 });
 
-app.listen(10000, () => {
-  console.log("🚀 Webhook szerver fut a 10000-es porton");
+// Render a 10000-es portot használja
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+    console.log(`🚀 Webhook szerver fut a ${PORT}-es porton`);
 });
