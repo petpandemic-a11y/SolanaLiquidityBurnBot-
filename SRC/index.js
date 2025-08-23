@@ -1,176 +1,232 @@
-import 'dotenv/config';
-import fetch from 'node-fetch';
-import { Telegraf } from 'telegraf';
-import { Connection, PublicKey, clusterApiUrl } from '@solana/web3.js';
-import { getMint } from '@solana/spl-token';
+// ===========================
+// Solana Burn Bot - FINAL
+// ===========================
 
-/**
- * ENV változók:
- *  BOT_TOKEN          Telegram bot token
- *  CHANNEL_ID         Telegram csatorna ID (pl. -1001234567890)
- *  BITQUERY_API_KEY   Bitquery API kulcs (ory_at_...)
- *  BIRDEYE_API_KEY    Birdeye API kulcs
- *  MIN_SOL            minimum SOL érték (pl. 0.1)
- *  MAX_MCAP_SOL       maximum marketcap SOL-ban (opcionális)
- */
+import fetch from "node-fetch";
+import { Telegraf } from "telegraf";
+import dotenv from "dotenv";
 
-const {
-  BOT_TOKEN,
-  CHANNEL_ID,
-  BITQUERY_API_KEY,
-  BIRDEYE_API_KEY,
-  MIN_SOL = '0.1',
-  MAX_MCAP_SOL,
-  RPC_URL
-} = process.env;
+dotenv.config();
 
-if (!BOT_TOKEN) throw new Error('❌ BOT_TOKEN missing');
-if (!CHANNEL_ID) throw new Error('❌ CHANNEL_ID missing');
-if (!BITQUERY_API_KEY) throw new Error('❌ BITQUERY_API_KEY missing');
-if (!BIRDEYE_API_KEY) throw new Error('❌ BIRDEYE_API_KEY missing');
+// === ENV CONFIG ===
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const CHANNEL_ID = process.env.CHANNEL_ID;
+const BITQUERY_API_KEY = process.env.BITQUERY_API_KEY;
+const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
+const MIN_SOL = parseFloat(process.env.MIN_SOL || "0.1");
+const MAX_MCAP_SOL = parseFloat(process.env.MAX_MCAP_SOL || "0");
+const POLL_INTERVAL_SEC = parseInt(process.env.POLL_INTERVAL_SEC || "10");
+const POLL_LOOKBACK_SEC = parseInt(process.env.POLL_LOOKBACK_SEC || "12");
+const DEDUP_MINUTES = parseInt(process.env.DEDUP_MINUTES || "10");
 
+const ADMIN_ID = process.env.ADMIN_ID;
+
+// === TELEGRAM BOT ===
 const bot = new Telegraf(BOT_TOKEN);
-const connection = new Connection(RPC_URL || clusterApiUrl('mainnet-beta'), 'confirmed');
 
-// ===== helpers =====
-const seen = new Map();
-const dedupMs = 10 * 60 * 1000; // 10 perc
+// === GLOBAL STATE ===
+let dedupCache = new Map();
+let lpMode = "strict";
+let pollInterval = POLL_INTERVAL_SEC;
 
-const short = (s) => (s && s.length > 10 ? s.slice(0, 4) + '…' + s.slice(-4) : s);
-const fmtNum = (x, d = 2) => (x == null ? 'n/a' : Number(x).toLocaleString(undefined, { maximumFractionDigits: d }));
+// === HELPERS ===
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ===== ár lekérés =====
 async function getSolUsd() {
   try {
-    const r = await fetch('https://public-api.birdeye.so/public/price?address=So11111111111111111111111111111111111111112', {
-      headers: { 'X-API-KEY': BIRDEYE_API_KEY }
+    const r = await fetch("https://public-api.birdeye.so/public/price?address=So11111111111111111111111111111111111111112", {
+      headers: { "X-API-KEY": BIRDEYE_API_KEY }
     });
     const j = await r.json();
     return j?.data?.value || null;
   } catch (e) {
-    console.error('[birdeye SOL price] error:', e.message);
+    console.error("[Birdeye SOL price]", e.message);
     return null;
   }
 }
 
-async function getUsdPriceByMint(mint) {
+async function getTokenPrice(mint) {
   try {
     const r = await fetch(`https://public-api.birdeye.so/public/price?address=${mint}`, {
-      headers: { 'X-API-KEY': BIRDEYE_API_KEY }
+      headers: { "X-API-KEY": BIRDEYE_API_KEY }
     });
     const j = await r.json();
     return j?.data?.value || null;
-  } catch (e) {
-    console.error('[birdeye token price] error:', e.message);
+  } catch {
     return null;
   }
 }
 
-// ===== Bitquery lekérés =====
-const GQL = (sec) => `
-query MyQuery {
-  solana(network: solana) {
-    instructions(
-      options: {limit: 50, desc: "block.time"}
-      time: {since: "now-${sec}s"}
-      where: {program: {method: {is: "burn"}}}
-    ) {
-      transaction { signature }
-      block { time }
-      instruction {
-        accounts { address }
+async function fetchBurns() {
+  const query = `
+    query {
+      Solana {
+        Instructions(
+          where: { Instruction: { Program: { is: "spl-token" }, Method: { is: "burn" } } }
+          limit: { count: 500 }
+          orderBy: { descending: Block_Time }
+        ) {
+          Transaction {
+            Signature
+          }
+          Instruction {
+            Accounts {
+              Account
+            }
+            Data {
+              Parsed {
+                Info {
+                  Amount
+                }
+              }
+            }
+          }
+          Block {
+            Time
+          }
+        }
       }
-    }
+    }`;
+  try {
+    const r = await fetch("https://streaming.bitquery.io/eap", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": BITQUERY_API_KEY
+      },
+      body: JSON.stringify({ query })
+    });
+    const j = await r.json();
+    return j.data?.Solana?.Instructions || [];
+  } catch (e) {
+    console.error("[Bitquery] fetch error:", e.message);
+    return [];
   }
-}`;
+}
 
-async function bitqueryFetch(query) {
-  const res = await fetch('https://graphql.bitquery.io/', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-API-KEY': BITQUERY_API_KEY,
-    },
-    body: JSON.stringify({ query })
+function shouldSkip(sig) {
+  const last = dedupCache.get(sig);
+  const now = Date.now();
+  if (last && now - last < DEDUP_MINUTES * 60_000) return true;
+  dedupCache.set(sig, now);
+  return false;
+}
+
+async function postBurn(burn) {
+  const {
+    sig,
+    mint,
+    burnSol,
+    priceUsd,
+    mcapSol,
+    liqUsd
+  } = burn;
+
+  if (burnSol < MIN_SOL) return;
+  if (MAX_MCAP_SOL > 0 && mcapSol && mcapSol > MAX_MCAP_SOL) return;
+  if (lpMode === "strict" && liqUsd !== 0) return;
+
+  const tokenPrice = priceUsd ? `${(priceUsd).toFixed(6)} USD` : "n/a";
+  const burnSolFmt = `${burnSol.toFixed(4)} ◎`;
+  const mcapFmt = mcapSol ? `${mcapSol.toFixed(2)} ◎` : "n/a";
+  const liqFmt = liqUsd !== undefined ? `${liqUsd}` : "n/a";
+
+  const text = `🔥 **TOKEN BURN DETECTED** 🔥
+━━━━━━━━━━━━━━━━━━━━━━
+**Token:** [${mint}](https://solscan.io/token/${mint})
+**Amount burned:** ${burnSolFmt}
+**Price:** ${tokenPrice}
+**Marketcap:** ${mcapFmt}
+**Liquidity:** ${liqFmt}
+━━━━━━━━━━━━━━━━━━━━━━
+[Solscan](https://solscan.io/tx/${sig}) | [Birdeye](https://birdeye.so/token/${mint}) | [DexScreener](https://dexscreener.com/solana/${mint})`;
+
+  await bot.telegram.sendMessage(CHANNEL_ID, text, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true
   });
-  const j = await res.json();
-  if (j.errors) throw new Error('Bitquery error: ' + JSON.stringify(j.errors));
-  return j;
 }
 
-// ===== posztolás =====
-async function postReport(burn) {
-  const solUsdPrice = await getSolUsd();
-  const tokenUsdPrice = burn.mint ? await getUsdPriceByMint(burn.mint) : null;
+// === POLLING ===
+async function poll() {
+  console.log("[POLL] start", new Date().toISOString());
+  const burns = await fetchBurns();
+  const solUsd = await getSolUsd();
 
-  let burnSol = null;
-  if (burn.amount && tokenUsdPrice && solUsdPrice) {
-    burnSol = (burn.amount * tokenUsdPrice) / solUsdPrice;
-  }
+  for (const b of burns) {
+    const sig = b.Transaction.Signature;
+    if (shouldSkip(sig)) continue;
 
-  let mcapSol = null;
-  if (burn.fdv && solUsdPrice) {
-    mcapSol = burn.fdv / solUsdPrice;
-  }
+    const mint = b.Instruction.Accounts[0]?.Account || "unknown";
+    const amount = parseFloat(b.Instruction.Data.Parsed.Info.Amount || "0");
+    const priceUsd = await getTokenPrice(mint);
+    const burnSol = priceUsd && solUsd ? amount * priceUsd / solUsd : 0;
 
-  if (Number(MIN_SOL) > 0 && (!burnSol || burnSol < Number(MIN_SOL))) {
-    console.log(`[SKIP < MIN_SOL] sig=${burn.sig} mint=${short(burn.mint)} burnSol=${burnSol}`);
-    return false;
-  }
-  if (MAX_MCAP_SOL && mcapSol && mcapSol > Number(MAX_MCAP_SOL)) {
-    console.log(`[SKIP > MAX_MCAP_SOL] sig=${burn.sig} mcapSol=${mcapSol}`);
-    return false;
-  }
-
-  const text = [
-    `Burn event`,
-    `Amount: ${fmtNum(burn.amount, 6)} (~${fmtNum(burnSol, 2)} SOL)`,
-    `Total Supply: ${fmtNum(burn.supply, 0)}`,
-    `Tx: https://solscan.io/tx/${burn.sig}`,
-    `Mint: ${burn.mint}`
-  ].join('\n');
-
-  await bot.telegram.sendMessage(CHANNEL_ID, text, { disable_web_page_preview: true });
-  console.log(`[POSTED] ${burn.sig}`);
-  return true;
-}
-
-// ===== polling =====
-async function pollOnce() {
-  const json = await bitqueryFetch(GQL(30));
-  const nodes = json?.data?.solana?.instructions || [];
-
-  for (const n of nodes) {
-    const sig = n?.transaction?.signature;
-    const mint = n?.instruction?.accounts?.[0]?.address;
-    if (!sig || !mint) continue;
-
-    if (seen.has(sig) && Date.now() - seen.get(sig) < dedupMs) continue;
-    seen.set(sig, Date.now());
-
-    const burn = { sig, mint, amount: 0.0, supply: null, fdv: null };
-    await postReport(burn);
+    await postBurn({
+      sig,
+      mint,
+      burnSol,
+      priceUsd,
+      mcapSol: null,
+      liqUsd: 0
+    });
   }
 }
 
-// ===== Telegram parancsok =====
-bot.command('ping', (ctx) => ctx.reply('pong'));
-bot.command('setmin', (ctx) => {
-  const parts = ctx.message.text.split(' ');
-  if (parts[1]) {
-    process.env.MIN_SOL = parts[1];
-    ctx.reply(`✅ MIN_SOL updated: ${parts[1]}`);
-  } else {
-    ctx.reply(`Current MIN_SOL = ${process.env.MIN_SOL}`);
+// === HEARTBEAT ===
+setInterval(() => {
+  console.log("[HEARTBEAT]", new Date().toISOString());
+}, 15_000);
+
+// === COMMANDS ===
+bot.command("ping", (ctx) => ctx.reply("pong"));
+bot.command("status", (ctx) =>
+  ctx.reply(`MIN_SOL=${MIN_SOL} ◎\nMAX_MCAP_SOL=${MAX_MCAP_SOL}\nLP Mode=${lpMode}\nInterval=${pollInterval}s`)
+);
+bot.command("setminsol", (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const val = parseFloat(ctx.message.text.split(" ")[1]);
+  if (!isNaN(val)) {
+    process.env.MIN_SOL = val;
+    ctx.reply(`✅ MIN_SOL updated: ${val} ◎`);
   }
 });
+bot.command("setmaxmcap", (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const val = parseFloat(ctx.message.text.split(" ")[1]);
+  if (!isNaN(val)) {
+    process.env.MAX_MCAP_SOL = val;
+    ctx.reply(`✅ MAX_MCAP_SOL updated: ${val} ◎`);
+  }
+});
+bot.command("setlp", (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const mode = ctx.message.text.split(" ")[1];
+  if (mode === "strict" || mode === "relaxed") {
+    lpMode = mode;
+    ctx.reply(`✅ LP mode: ${mode}`);
+  }
+});
+bot.command("setinterval", (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  const val = parseInt(ctx.message.text.split(" ")[1]);
+  if (!isNaN(val) && val >= 5) {
+    pollInterval = val;
+    ctx.reply(`✅ Interval updated: ${val}s`);
+  }
+});
+bot.command("debugpoll", async (ctx) => {
+  if (ctx.from.id.toString() !== ADMIN_ID) return;
+  ctx.reply("🔄 Manual poll...");
+  await poll();
+  ctx.reply("✅ Done!");
+});
 
-// ===== indulás =====
+// === START ===
 (async () => {
-  await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
   await bot.launch();
-  console.log('✅ Bot launched (polling)');
+  console.log("[BOT] started");
 
-  setInterval(() => console.log('[HEARTBEAT]', new Date().toISOString()), 15000);
-  setInterval(pollOnce, 15000);
+  // Start polling loop
+  setInterval(poll, pollInterval * 1000);
 })();
