@@ -338,13 +338,55 @@ bot.command("setmaxmcap",ctx=>{
   if(!isAdmin(ctx)) return ctx.reply("No permission");
   const v=Number((ctx.message.text.split(" ")[1])||0);
   cfg.maxMcapSol=v; ctx.reply("MAX_MCAP_SOL="+v);
-});
-bot.command("setlp",ctx=>{
+});bot.command("debugpoll",ctx=>{
   if(!isAdmin(ctx)) return ctx.reply("No permission");
-  const arg=(ctx.message.text.split(" ")[1]||"").toLowerCase();
-  if(arg==="relaxed"){ lpStrict=false; ctx.reply("LP mode=relaxed"); }
-  else { lpStrict=true; ctx.reply("LP mode=strict"); }
+  pollOnce()
+    .then(()=>ctx.reply("debugpoll: ok"))
+    .catch(e=>ctx.reply("debugpoll err: "+(e?.message||String(e))));
 });
-bot.command("debugpoll",ctx=>{
+
+bot.command("setinterval",ctx=>{
   if(!isAdmin(ctx)) return ctx.reply("No permission");
-  pollOnce().then(()=>ctx.reply("
+  const v = Number((ctx.message?.text||"").split(" ")[1]);
+  if (!isFinite(v) || v < 5) return ctx.reply("Usage: /setinterval <seconds>=5..");
+  cfg.pollIntervalSec = v;
+  restartPolling();
+  return ctx.reply("Poll interval set to "+v+"s");
+});
+
+/* ===== Start (409-safe) ===== */
+(async function(){
+  // biztos ami biztos: webhook törlés, hogy polling mehessen 409 nélkül
+  try { await bot.telegram.deleteWebhook({ drop_pending_updates: true }); }
+  catch(e){ console.warn("[deleteWebhook warn]", e?.description || e?.message || e); }
+
+  try {
+    await bot.launch({ dropPendingUpdates: true });
+    console.log("Telegraf launched (polling ON).");
+  } catch (e) {
+    console.error("Telegraf launch failed:", e?.description || e?.message || e);
+  }
+
+  // induló státusz üzenet a csatornába (nem kritikus)
+  try {
+    const boot = [
+      "BurnBot started (SOL mode)",
+      "MIN_SOL >= "+cfg.minSol+" SOL",
+      "MAX_MCAP_SOL "+(cfg.maxMcapSol>0 ? ("<= "+cfg.maxMcapSol+" SOL") : "off"),
+      "Poll="+cfg.pollIntervalSec+"s  Window="+cfg.lookbackSec+"s  Dedup="+cfg.dedupMinutes+"m",
+      "LP mode="+(lpStrict ? "strict (only liqUsd==0)" : "relaxed (n/a allowed)"),
+      "Price: Birdeye"
+    ].join("\n");
+    await bot.telegram.sendMessage(CHANNEL_ID, boot, { disable_web_page_preview: true });
+  } catch(e) {
+    console.error("[startup send error]", e?.message || e);
+  }
+
+  // első poll és időzítő
+  await pollOnce();
+  restartPolling();
+})();
+
+// leállás kezelése
+process.once("SIGINT", function(){ bot.stop("SIGINT"); });
+process.once("SIGTERM", function(){ bot.stop("SIGTERM"); });
