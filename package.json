@@ -2,10 +2,10 @@
   "name": "solana-lp-burn-monitor",
   "version": "3.2.0",
   "description": "Telegram bot Solana LP burn eseményekhez (Raydium, Jupiter, Orca, Helius API)",
-  "main": "SRC/index.js",
+  "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node SRC/index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "@solana/web3.js": "^1.95.3",
