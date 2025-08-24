@@ -1,64 +1,64 @@
-import express from "express";
-import dotenv from "dotenv";
+import axios from "axios";
 import TelegramBot from "node-telegram-bot-api";
+import dotenv from "dotenv";
+import fs from "fs";
+import { fetchLPTokens } from "./pools.js";
 
 dotenv.config();
 
-const app = express();
-app.use(express.json());
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
+const channelId = process.env.TELEGRAM_CHANNEL_ID;
+const heliusKey = process.env.HELIUS_API_KEY;
+const cachePath = "./SRC/lp-cache.json";
+const heliusUrl = `https://mainnet.helius-rpc.com/?api-key=${heliusKey}`;
+const checkInterval = parseInt(process.env.CHECK_INTERVAL) || 10000;
 
-// Telegram bot inicializálás
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
-const CHANNEL_ID = process.env.CHANNEL_ID;
+// Előzőleg figyelt LP tokenek
+let lpTokens = fs.existsSync(cachePath)
+  ? JSON.parse(fs.readFileSync(cachePath))
+  : [];
 
-// Helius webhook endpoint
-app.post("/webhook", async (req, res) => {
-    try {
-        const data = req.body;
+// LP tokenek frissítése 10 percenként
+setInterval(async () => {
+  lpTokens = await fetchLPTokens();
+}, 10 * 60 * 1000);
 
-        // Ellenőrizzük, hogy van-e tranzakció adat
-        if (!data || !data[0] || !data[0].tokenTransfers || data[0].tokenTransfers.length === 0) {
-            console.log("⚠️ Nincsenek token tranzakciók ebben a webhookban.");
-            return res.status(200).send("OK");
-        }
+// LP-burn ellenőrzés
+async function checkBurns() {
+  try {
+    for (const lpMint of lpTokens) {
+      const body = {
+        jsonrpc: "2.0",
+        id: "burn-check",
+        method: "getTokenSupply",
+        params: [lpMint],
+      };
 
-        // Végigmegyünk az összes token transferen
-        for (const tx of data[0].tokenTransfers) {
-            const { tokenAmount, mint, fromUserAccount, toUserAccount } = tx;
+      const res = await axios.post(heliusUrl, body);
+      const totalSupply = parseInt(res.data.result.value.amount);
 
-            // Csak akkor érdekel, ha a token "elégett" → célcím = burn address
-            const burnAddresses = [
-                "11111111111111111111111111111111",
-                "1nc1nerator11111111111111111111111111111",
-                "burn111111111111111111111111111111111111111"
-            ];
-
-            if (burnAddresses.includes(toUserAccount)) {
-                const signature = data[0].signature || "Ismeretlen";
-
-                const message = `
-🔥 *LP BURN ÉSZLELVE!* 🔥
-
-💧 Token: \`${mint}\`
-📉 Összeg: ${tokenAmount} LP
-📜 Tranzakció: [Nézd meg Solscan-en](https://solscan.io/tx/${signature})
-`;
-
-                // Üzenet küldése Telegram csatornára
-                await bot.sendMessage(CHANNEL_ID, message, { parse_mode: "Markdown" });
-                console.log("🚀 LP Burn észlelve, posztolva!");
-            }
-        }
-
-        res.status(200).send("OK");
-    } catch (error) {
-        console.error("❌ Webhook feldolgozási hiba:", error);
-        res.status(500).send("Hiba");
+      if (totalSupply === 0) {
+        console.log(`[Bot] 100% LP-burn észlelve: ${lpMint}`);
+        await sendBurnAlert(lpMint);
+      }
     }
-});
+  } catch (err) {
+    console.error("[Bot] Hiba az LP-burn ellenőrzésnél:", err.message);
+  }
+}
 
-// Szerver indítása Renderen
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-    console.log(`🚀 Webhook szerver fut a ${PORT}-es porton`);
-});
+// Telegram értesítés
+async function sendBurnAlert(lpMint) {
+  const msg = `
+🔥 <b>100% LP BURN ÉSZLELVE</b> 🔥
+
+LP Token: <code>${lpMint}</code>
+Tranzakció: https://solscan.io/token/${lpMint}
+`;
+  await bot.sendMessage(channelId, msg, { parse_mode: "HTML" });
+}
+
+// Időzített ellenőrzés
+setInterval(checkBurns, checkInterval);
+
+console.log("[Bot] LP-burn figyelő bot elindult...");
