@@ -35,6 +35,15 @@ app.post('/webhook', async (req, res) => {
         
         const webhookData = req.body;
         
+        // Debug: Log webhook structure
+        console.log('🔍 Webhook data keys:', Object.keys(webhookData));
+        if (webhookData[0]) {
+            console.log('🔍 First transaction keys:', Object.keys(webhookData[0]));
+            if (webhookData[0].tokenTransfers) {
+                console.log('🔍 Token transfers count:', webhookData[0].tokenTransfers.length);
+            }
+        }
+        
         if (Array.isArray(webhookData)) {
             for (const txData of webhookData) {
                 await processTransaction(txData);
@@ -89,12 +98,27 @@ async function checkForLPBurn(txData) {
         if (tokenTransfers && Array.isArray(tokenTransfers)) {
             for (const transfer of tokenTransfers) {
                 if (await isBurnTransfer(transfer)) {
+                    // Parse token amount properly
+                    let amount = 0;
+                    if (typeof transfer.tokenAmount === 'number') {
+                        amount = transfer.tokenAmount;
+                    } else if (typeof transfer.tokenAmount === 'string') {
+                        amount = parseFloat(transfer.tokenAmount);
+                    } else if (transfer.tokenAmount && transfer.tokenAmount.uiAmount) {
+                        amount = transfer.tokenAmount.uiAmount;
+                    }
+                    
+                    if (isNaN(amount) || amount < 1000000) {
+                        continue;
+                    }
+                    
+                    console.log(`🎯 LP BURN FOUND via transfer: ${amount.toLocaleString()} tokens`);
                     const tokenInfo = await getTokenInfo(transfer.mint);
                     
                     return {
                         signature,
                         mint: transfer.mint,
-                        burnedAmount: transfer.tokenAmount,
+                        burnedAmount: amount,
                         tokenName: tokenInfo.name,
                         tokenSymbol: tokenInfo.symbol,
                         timestamp: new Date()
@@ -109,7 +133,13 @@ async function checkForLPBurn(txData) {
                 if (account.tokenBalanceChanges) {
                     for (const change of account.tokenBalanceChanges) {
                         if (await isBurnBalanceChange(change)) {
-                            const burnAmount = Math.abs(change.tokenBalanceChange);
+                            const burnAmount = Math.abs(parseFloat(change.tokenBalanceChange) || 0);
+                            
+                            if (isNaN(burnAmount) || burnAmount < 1000000) {
+                                continue;
+                            }
+                            
+                            console.log(`🎯 LP BURN FOUND via balance: ${burnAmount.toLocaleString()} tokens`);
                             const tokenInfo = await getTokenInfo(change.mint);
                             
                             return {
@@ -135,10 +165,37 @@ async function checkForLPBurn(txData) {
 
 // Check if transfer is a burn (to null address or burn address)
 async function isBurnTransfer(transfer) {
-    const { toTokenAccount, tokenAmount, fromTokenAccount } = transfer;
+    const { toTokenAccount, tokenAmount, fromTokenAccount, mint } = transfer;
     
-    // Must be substantial amount
-    if (tokenAmount < 1000000) return false;
+    // Skip known stablecoins and major tokens
+    const skipTokens = [
+        'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+        'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT  
+        'So11111111111111111111111111111111111111112',   // SOL
+        '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R', // RAY
+        'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So'   // mSOL
+    ];
+    
+    if (skipTokens.includes(mint)) {
+        console.log(`⚠️ Skipping known token: ${mint.slice(0, 8)}...`);
+        return false;
+    }
+    
+    // Parse token amount properly
+    let amount = 0;
+    if (typeof tokenAmount === 'number') {
+        amount = tokenAmount;
+    } else if (typeof tokenAmount === 'string') {
+        amount = parseFloat(tokenAmount);
+    } else if (tokenAmount && tokenAmount.uiAmount) {
+        amount = tokenAmount.uiAmount;
+    }
+    
+    // Must be substantial amount (1M+ tokens)
+    if (isNaN(amount) || amount < 1000000) {
+        console.log(`⚠️ Amount too small or invalid: ${amount}`);
+        return false;
+    }
     
     // Check if burned (sent to null or burn addresses)
     const burnAddresses = [
@@ -154,63 +211,98 @@ async function isBurnTransfer(transfer) {
                          burnAddresses.includes(toTokenAccount) ||
                          toTokenAccount.includes('1111111111111111');
     
-    return isBurnAddress;
+    console.log(`🔍 Transfer check: ${amount.toLocaleString()} tokens, burn: ${isBurnAddress}`);
+    return isBurnAddress && amount >= 1000000;
 }
 
 // Check if balance change indicates burn
 async function isBurnBalanceChange(change) {
-    // Large negative change (tokens removed/burned)
-    const burnAmount = Math.abs(change.tokenBalanceChange);
+    const { mint, tokenBalanceChange } = change;
     
-    // Must be substantial burn
-    if (change.tokenBalanceChange >= 0 || burnAmount < 1000000) {
+    // Skip known stablecoins and major tokens
+    const skipTokens = [
+        'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+        'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT  
+        'So11111111111111111111111111111111111111112',   // SOL
+        '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R', // RAY
+        'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So'   // mSOL
+    ];
+    
+    if (skipTokens.includes(mint)) {
+        console.log(`⚠️ Skipping known token balance change: ${mint.slice(0, 8)}...`);
         return false;
     }
     
-    // Additional checks could be added here
+    // Parse balance change
+    let balanceChange = 0;
+    if (typeof tokenBalanceChange === 'number') {
+        balanceChange = tokenBalanceChange;
+    } else if (typeof tokenBalanceChange === 'string') {
+        balanceChange = parseFloat(tokenBalanceChange);
+    }
+    
+    // Large negative change (tokens removed/burned)
+    const burnAmount = Math.abs(balanceChange);
+    
+    // Must be substantial burn (negative change, 1M+ tokens)
+    if (balanceChange >= 0 || isNaN(burnAmount) || burnAmount < 1000000) {
+        console.log(`⚠️ Balance change not a burn: ${balanceChange}`);
+        return false;
+    }
+    
+    console.log(`🔍 Balance change: ${balanceChange.toLocaleString()} (burn: ${burnAmount.toLocaleString()})`);
     return true;
 }
 
 // Get token info using Helius API
 async function getTokenInfo(mintAddress) {
     try {
+        console.log(`📖 Getting token info for: ${mintAddress.slice(0, 8)}...`);
+        
         // Try Helius first
-        const response = await axios.get(
-            `https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`,
-            {
-                params: { mint: mintAddress },
-                timeout: 5000
-            }
-        );
+        const heliusUrl = `https://api.helius.xyz/v0/token-metadata`;
+        const response = await axios.get(heliusUrl, {
+            params: { 
+                'api-key': HELIUS_API_KEY,
+                mint: mintAddress 
+            },
+            timeout: 5000
+        });
         
         if (response.data && response.data.length > 0) {
             const token = response.data[0];
-            const metadata = token.onChainMetadata?.metadata || token.offChainMetadata || {};
+            const onChain = token.onChainMetadata?.metadata;
+            const offChain = token.offChainMetadata;
             
-            return {
-                name: metadata.name || 'Unknown Token',
-                symbol: metadata.symbol || 'UNKNOWN'
-            };
+            const name = onChain?.name || offChain?.name || 'Unknown Token';
+            const symbol = onChain?.symbol || offChain?.symbol || 'UNKNOWN';
+            
+            console.log(`✅ Helius token found: ${name} (${symbol})`);
+            return { name, symbol };
         }
 
+        console.log('⚠️ Helius token not found, trying Jupiter...');
+        
         // Fallback to Jupiter
         const jupiterResponse = await axios.get('https://token.jup.ag/strict', { timeout: 3000 });
         const jupiterToken = jupiterResponse.data.find(t => t.address === mintAddress);
         
         if (jupiterToken) {
+            console.log(`✅ Jupiter token found: ${jupiterToken.name} (${jupiterToken.symbol})`);
             return { 
                 name: jupiterToken.name, 
                 symbol: jupiterToken.symbol 
             };
         }
 
+        console.log('⚠️ Token not found in any API, using default');
         return { 
             name: 'Unknown Memecoin', 
             symbol: 'MEME' 
         };
         
     } catch (error) {
-        console.log(`Token info failed for ${mintAddress.slice(0, 8)}...:`, error.message);
+        console.error(`❌ Token info error for ${mintAddress.slice(0, 8)}:`, error.message);
         return { 
             name: 'Unknown Memecoin', 
             symbol: 'MEME' 
@@ -220,6 +312,12 @@ async function getTokenInfo(mintAddress) {
 
 // Send Telegram alert
 async function sendLPBurnAlert(burnInfo) {
+    // Validate burnedAmount
+    if (isNaN(burnInfo.burnedAmount) || burnInfo.burnedAmount <= 0) {
+        console.error('❌ Invalid burnedAmount:', burnInfo.burnedAmount);
+        return;
+    }
+    
     const message = `
 🔥 **100% LP ELÉGETVE!** 🔥
 
@@ -251,7 +349,7 @@ async function sendLPBurnAlert(burnInfo) {
         
         // Retry without markdown if failed
         try {
-            const plainMessage = message.replace(/[*`_]/g, '');
+            const plainMessage = message.replace(/[*`_\[\]]/g, '');
             await bot.sendMessage(TELEGRAM_CHAT_ID, plainMessage);
             console.log('✅ Alert sent (plain text fallback)');
         } catch (retryError) {
@@ -313,8 +411,25 @@ app.get('/', (req, res) => {
         status: 'online',
         webhook: '/webhook',
         health: '/health',
+        debug: '/debug',
         processed: processedTxs.size,
         uptime: process.uptime()
+    });
+});
+
+// Debug endpoint
+app.get('/debug', (req, res) => {
+    res.json({
+        processedTransactions: processedTxs.size,
+        lastProcessed: Array.from(processedTxs).slice(-10),
+        environment: {
+            hasTelegramToken: !!TELEGRAM_BOT_TOKEN,
+            hasTelegramChatId: !!TELEGRAM_CHAT_ID,
+            hasHeliusApiKey: !!HELIUS_API_KEY,
+            hasWebhookSecret: !!WEBHOOK_SECRET
+        },
+        uptime: process.uptime(),
+        memory: process.memoryUsage()
     });
 });
 
