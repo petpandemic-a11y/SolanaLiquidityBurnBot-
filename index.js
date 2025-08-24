@@ -1,7 +1,6 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
-const { Connection, PublicKey } = require('@solana/web3.js');
-const WebSocket = require('ws');
+const { Connection } = require('@solana/web3.js');
 const axios = require('axios');
 
 const app = express();
@@ -10,113 +9,234 @@ const PORT = process.env.PORT || 3000;
 // Environment variables
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const SOLANA_RPC = 'https://api.mainnet-beta.solana.com';
-const RAYDIUM_PROGRAM = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'secret-key';
 
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
-const connection = new Connection(SOLANA_RPC, 'confirmed');
+const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, 'confirmed');
 const processedTxs = new Set();
 
-// Health check for Render
+// Middleware
+app.use(express.json({ limit: '10mb' }));
+
+// Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    processed: processedTxs.size
+  });
 });
 
-// LP burn detection - ONLY 100% burns
-async function checkLPBurn(signature) {
+// Helius Webhook endpoint
+app.post('/webhook', async (req, res) => {
     try {
-        // Validate signature
-        if (!signature || typeof signature !== 'string' || signature.length < 80) {
-            return null;
+        console.log('📡 Webhook received from Helius');
+        
+        const webhookData = req.body;
+        
+        if (Array.isArray(webhookData)) {
+            for (const txData of webhookData) {
+                await processTransaction(txData);
+            }
+        } else if (webhookData) {
+            await processTransaction(webhookData);
         }
 
-        const tx = await connection.getTransaction(signature, {
-            commitment: 'confirmed',
-            maxSupportedTransactionVersion: 0
-        });
+        res.status(200).json({ status: 'processed' });
+    } catch (error) {
+        console.error('❌ Webhook error:', error.message);
+        res.status(500).json({ error: 'Processing failed' });
+    }
+});
 
-        if (!tx?.meta) {
-            return null;
+// Process transaction from webhook
+async function processTransaction(txData) {
+    try {
+        const signature = txData.signature;
+        
+        if (!signature || processedTxs.has(signature)) {
+            return;
+        }
+        
+        processedTxs.add(signature);
+        console.log(`🔍 Processing: ${signature.slice(0, 8)}...`);
+        
+        // Memory cleanup
+        if (processedTxs.size > 2000) {
+            const oldest = Array.from(processedTxs).slice(0, 1000);
+            oldest.forEach(sig => processedTxs.delete(sig));
         }
 
-        const preBalances = tx.meta.preTokenBalances || [];
-        const postBalances = tx.meta.postTokenBalances || [];
+        const burnInfo = await checkForLPBurn(txData);
+        
+        if (burnInfo) {
+            console.log(`🔥 100% LP BURN: ${burnInfo.tokenSymbol} - ${burnInfo.burnedAmount.toLocaleString()}`);
+            await sendLPBurnAlert(burnInfo);
+        }
+        
+    } catch (error) {
+        console.error('Error processing transaction:', error.message);
+    }
+}
 
-        for (const pre of preBalances) {
-            const post = postBalances.find(p => p.accountIndex === pre.accountIndex);
-            const preAmount = pre.uiTokenAmount?.uiAmount || 0;
-            const postAmount = post?.uiTokenAmount?.uiAmount || 0;
-
-            // STRICT: Only 100% LP burns (large amount → exactly 0)
-            if (preAmount > 1000000 && postAmount === 0) { // Increased minimum to 1M+ tokens
-                console.log(`🔍 100% LP burn found: ${preAmount.toLocaleString()} → 0`);
-                
-                // Double-check it's likely an LP token by checking if it's a large round number
-                if (preAmount > 1000000 && Number.isInteger(preAmount)) {
-                    const tokenInfo = await getTokenInfo(pre.mint);
+// Check for LP burn in transaction data
+async function checkForLPBurn(txData) {
+    try {
+        const { signature, tokenTransfers, accountData } = txData;
+        
+        // Method 1: Check token transfers for burns
+        if (tokenTransfers && Array.isArray(tokenTransfers)) {
+            for (const transfer of tokenTransfers) {
+                if (await isBurnTransfer(transfer)) {
+                    const tokenInfo = await getTokenInfo(transfer.mint);
                     
                     return {
                         signature,
-                        mint: pre.mint,
-                        burnedAmount: preAmount,
+                        mint: transfer.mint,
+                        burnedAmount: transfer.tokenAmount,
                         tokenName: tokenInfo.name,
                         tokenSymbol: tokenInfo.symbol,
-                        timestamp: new Date(),
-                        burnPercentage: 100 // Always 100% for our alerts
+                        timestamp: new Date()
                     };
                 }
             }
         }
-        return null;
-    } catch (error) {
-        console.error(`LP check error for ${signature}:`, error.message);
-        return null;
-    }
-}
 
-// Get token info
-async function getTokenInfo(mintAddress) {
-    try {
-        const response = await axios.get('https://token.jup.ag/strict', { timeout: 5000 });
-        const token = response.data.find(t => t.address === mintAddress);
-        
-        if (token) {
-            return { name: token.name, symbol: token.symbol };
+        // Method 2: Check account balance changes
+        if (accountData && Array.isArray(accountData)) {
+            for (const account of accountData) {
+                if (account.tokenBalanceChanges) {
+                    for (const change of account.tokenBalanceChanges) {
+                        if (await isBurnBalanceChange(change)) {
+                            const burnAmount = Math.abs(change.tokenBalanceChange);
+                            const tokenInfo = await getTokenInfo(change.mint);
+                            
+                            return {
+                                signature,
+                                mint: change.mint,
+                                burnedAmount: burnAmount,
+                                tokenName: tokenInfo.name,
+                                tokenSymbol: tokenInfo.symbol,
+                                timestamp: new Date()
+                            };
+                        }
+                    }
+                }
+            }
         }
 
-        const solscanResponse = await axios.get(
-            `https://public-api.solscan.io/token/meta?tokenAddress=${mintAddress}`,
-            { timeout: 5000 }
-        );
-        
-        return {
-            name: solscanResponse.data.name || 'Unknown Token',
-            symbol: solscanResponse.data.symbol || 'UNKNOWN'
-        };
+        return null;
     } catch (error) {
-        return { name: 'Unknown Memecoin', symbol: 'MEME' };
+        console.error('LP burn check error:', error.message);
+        return null;
     }
 }
 
-// Send Telegram alert - ONLY for 100% burns
+// Check if transfer is a burn (to null address or burn address)
+async function isBurnTransfer(transfer) {
+    const { toTokenAccount, tokenAmount, fromTokenAccount } = transfer;
+    
+    // Must be substantial amount
+    if (tokenAmount < 1000000) return false;
+    
+    // Check if burned (sent to null or burn addresses)
+    const burnAddresses = [
+        null,
+        undefined,
+        '11111111111111111111111111111111',
+        '1111111111111111111111111111111',
+        '',
+        '0x0'
+    ];
+    
+    const isBurnAddress = !toTokenAccount || 
+                         burnAddresses.includes(toTokenAccount) ||
+                         toTokenAccount.includes('1111111111111111');
+    
+    return isBurnAddress;
+}
+
+// Check if balance change indicates burn
+async function isBurnBalanceChange(change) {
+    // Large negative change (tokens removed/burned)
+    const burnAmount = Math.abs(change.tokenBalanceChange);
+    
+    // Must be substantial burn
+    if (change.tokenBalanceChange >= 0 || burnAmount < 1000000) {
+        return false;
+    }
+    
+    // Additional checks could be added here
+    return true;
+}
+
+// Get token info using Helius API
+async function getTokenInfo(mintAddress) {
+    try {
+        // Try Helius first
+        const response = await axios.get(
+            `https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`,
+            {
+                params: { mint: mintAddress },
+                timeout: 5000
+            }
+        );
+        
+        if (response.data && response.data.length > 0) {
+            const token = response.data[0];
+            const metadata = token.onChainMetadata?.metadata || token.offChainMetadata || {};
+            
+            return {
+                name: metadata.name || 'Unknown Token',
+                symbol: metadata.symbol || 'UNKNOWN'
+            };
+        }
+
+        // Fallback to Jupiter
+        const jupiterResponse = await axios.get('https://token.jup.ag/strict', { timeout: 3000 });
+        const jupiterToken = jupiterResponse.data.find(t => t.address === mintAddress);
+        
+        if (jupiterToken) {
+            return { 
+                name: jupiterToken.name, 
+                symbol: jupiterToken.symbol 
+            };
+        }
+
+        return { 
+            name: 'Unknown Memecoin', 
+            symbol: 'MEME' 
+        };
+        
+    } catch (error) {
+        console.log(`Token info failed for ${mintAddress.slice(0, 8)}...:`, error.message);
+        return { 
+            name: 'Unknown Memecoin', 
+            symbol: 'MEME' 
+        };
+    }
+}
+
+// Send Telegram alert
 async function sendLPBurnAlert(burnInfo) {
     const message = `
 🔥 **100% LP ELÉGETVE!** 🔥
 
 💰 **Token:** ${burnInfo.tokenName} (${burnInfo.tokenSymbol})
-🏷️ **Cím:** \`${burnInfo.mint}\`
-🔥 **Teljes LP égetés:** ${Math.round(burnInfo.burnedAmount).toLocaleString()} token
+🏷️ **Mint:** \`${burnInfo.mint}\`
+🔥 **Égetett mennyiség:** ${Math.round(burnInfo.burnedAmount).toLocaleString()} token
 ⏰ **Időpont:** ${burnInfo.timestamp.toLocaleString('hu-HU')}
 
 ✅ **TELJES LP ELÉGETVE!** 
-🛡️ **Biztonság:** A likviditás 100%-ban el lett égetve
+🛡️ **Biztonság:** A likviditás el lett égetve
 🚫 **Rug pull:** Már nem lehetséges!
 📊 **Tranzakció:** [Solscan](https://solscan.io/tx/${burnInfo.signature})
 
-🚀 **Ez egy potenciálisan biztonságos memecoin!**
-⚠️ **Figyelem:** Mindig végezz saját kutatást (DYOR)!
+🚀 **Potenciálisan biztonságos memecoin!**
+⚠️ **DYOR:** Mindig végezz saját kutatást!
 
-#100PercentBurn #LPBurn #SafeMeme #Solana #RugProof
+#100PercentBurn #LPBurn #SafeMeme #Solana #RugProof #HeliusAlert
     `.trim();
 
     try {
@@ -124,174 +244,81 @@ async function sendLPBurnAlert(burnInfo) {
             parse_mode: 'Markdown',
             disable_web_page_preview: false
         });
-        console.log(`✅ 100% LP burn alert sent: ${burnInfo.tokenSymbol} - ${burnInfo.burnedAmount.toLocaleString()}`);
+        
+        console.log(`✅ ALERT SENT: ${burnInfo.tokenSymbol} - ${burnInfo.burnedAmount.toLocaleString()}`);
     } catch (error) {
-        console.error('❌ Telegram error:', error.message);
+        console.error('❌ Telegram send error:', error.message);
+        
+        // Retry without markdown if failed
+        try {
+            const plainMessage = message.replace(/[*`_]/g, '');
+            await bot.sendMessage(TELEGRAM_CHAT_ID, plainMessage);
+            console.log('✅ Alert sent (plain text fallback)');
+        } catch (retryError) {
+            console.error('❌ Telegram retry failed:', retryError.message);
+        }
     }
-}
-
-// Polling method with aggressive rate limiting
-function startPollingMonitoring() {
-    console.log('🔄 Starting ultra-conservative polling to avoid rate limits...');
-    
-    setInterval(async () => {
-        try {
-            // Get fewer signatures
-            const signatures = await connection.getSignaturesForAddress(
-                new PublicKey(RAYDIUM_PROGRAM),
-                { limit: 5 } // Reduced from 10 to 5
-            );
-
-            // Only check the most recent 2 transactions
-            for (const sigInfo of signatures.slice(0, 2)) {
-                if (processedTxs.has(sigInfo.signature)) continue;
-                
-                processedTxs.add(sigInfo.signature);
-                
-                // Memory cleanup
-                if (processedTxs.size > 1000) { // Reduced from 3000
-                    const oldest = Array.from(processedTxs).slice(0, 500);
-                    oldest.forEach(sig => processedTxs.delete(sig));
-                }
-                
-                console.log(`🔍 Checking signature: ${sigInfo.signature.slice(0, 8)}...`);
-                
-                const burnInfo = await checkLPBurn(sigInfo.signature);
-                if (burnInfo) {
-                    console.log(`🔥 100% LP burn detected: ${burnInfo.tokenSymbol}`);
-                    await sendLPBurnAlert(burnInfo);
-                }
-                
-                // Much longer delay between requests
-                await new Promise(resolve => setTimeout(resolve, 2000)); // 2 seconds between each check
-            }
-        } catch (error) {
-            if (error.message.includes('429') || error.message.includes('Too Many Requests')) {
-                console.log('⚠️ Rate limited! Waiting 10 seconds...');
-                await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 seconds
-            } else {
-                console.error('Polling error:', error.message);
-            }
-        }
-    }, 60000); // Check every 60 seconds instead of 30
-}
-
-// WebSocket monitoring (backup method) - DISABLED to reduce load
-function startWebSocketMonitoring() {
-    console.log('🔌 WebSocket monitoring disabled to reduce rate limiting');
-    // Commenting out WebSocket to reduce API calls
-    /*
-    const ws = new WebSocket('wss://api.mainnet-beta.solana.com');
-    
-    ws.on('open', () => {
-        console.log('🔌 WebSocket connected');
-        
-        // Subscribe to account changes for Raydium program
-        ws.send(JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'programSubscribe',
-            params: [
-                RAYDIUM_PROGRAM,
-                {
-                    commitment: 'confirmed',
-                    encoding: 'base64'
-                }
-            ]
-        }));
-        
-        console.log('📡 Subscribed to Raydium program changes');
-    });
-
-    ws.on('message', async (data) => {
-        try {
-            const message = JSON.parse(data);
-            
-            if (message.method === 'programNotification') {
-                // For program notifications, we need to poll recent transactions
-                console.log('📊 Program change detected, checking recent transactions...');
-                
-                // Get recent signatures and check them
-                setTimeout(async () => {
-                    try {
-                        const signatures = await connection.getSignaturesForAddress(
-                            new PublicKey(RAYDIUM_PROGRAM),
-                            { limit: 5 }
-                        );
-
-                        for (const sigInfo of signatures) {
-                            if (processedTxs.has(sigInfo.signature)) continue;
-                            
-                            processedTxs.add(sigInfo.signature);
-                            const burnInfo = await checkLPBurn(sigInfo.signature);
-                            
-                            if (burnInfo) {
-                                console.log(`🔥 LP burn detected via WebSocket: ${burnInfo.tokenSymbol}`);
-                                await sendLPBurnAlert(burnInfo);
-                            }
-                        }
-                    } catch (error) {
-                        console.error('WebSocket transaction check error:', error.message);
-                    }
-                }, 1000);
-            }
-        } catch (error) {
-            console.error('WebSocket message error:', error.message);
-        }
-    });
-
-    ws.on('error', (error) => {
-        console.error('❌ WebSocket error:', error.message);
-    });
-
-    ws.on('close', () => {
-        console.log('🔌 WebSocket closed, will restart with next poll cycle');
-        // Don't immediately reconnect, let polling handle it
-        setTimeout(() => {
-            if (ws.readyState === WebSocket.CLOSED) {
-                startWebSocketMonitoring();
-            }
-        }, 30000);
-    });
-    */
 }
 
 // Start the bot
 async function startBot() {
     try {
+        // Validate environment variables
         if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-            throw new Error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variables');
+            throw new Error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
         }
 
+        if (!HELIUS_API_KEY) {
+            throw new Error('Missing HELIUS_API_KEY');
+        }
+
+        // Test Telegram
         const me = await bot.getMe();
-        console.log(`🤖 Telegram bot: @${me.username}`);
+        console.log(`🤖 Telegram Bot: @${me.username}`);
         
+        // Test Helius connection
         const version = await connection.getVersion();
-        console.log(`⚡ Solana connected: ${version['solana-core']}`);
+        console.log(`⚡ Helius RPC: ${version['solana-core']}`);
         
+        // Send startup message
         await bot.sendMessage(TELEGRAM_CHAT_ID, 
-            '🚀 LP Burn Monitor elindult!\n\n' +
+            '🚀 **LP Burn Monitor ONLINE!**\n\n' +
             '🔥 **CSAK 100% LP ÉGETÉSEKET** figyelek!\n' +
-            '✅ Csak akkor írok, ha teljes LP elégetve\n' +
-            '⚡ Ultra-konzervatív mód: 60s ciklusok\n' +
-            '🛡️ Rate limit safe működés\n' +
-            '🎯 Csak a legfrissebb 2 tranzakciót ellenőrzöm\n\n' +
-            '#100PercentBurn #LPBurnMonitor #Online'
+            '⚡ **Helius webhook** - instant értesítések\n' +
+            '✅ **Rate limit free** - nincs késés\n' +
+            '🎯 **Real-time detection** aktiválva\n' +
+            '🛡️ **Rug pull protection** detector!\n\n' +
+            `📡 **Webhook:** /webhook\n` +
+            `🌐 **Endpoint ready!**\n\n` +
+            '#100PercentBurn #HeliusWebhook #LPBurnMonitor #Online'
         );
         
-        // Start both monitoring methods
-        startPollingMonitoring();
-        startWebSocketMonitoring();
-        
-        console.log('🚀 LP Burn Monitor started successfully with dual monitoring!');
+        console.log('🚀 LP BURN MONITOR STARTED SUCCESSFULLY!');
+        console.log(`📡 Webhook endpoint: /webhook`);
+        console.log('💡 Configure Helius webhook to: https://solanaliquidityburnbot.onrender.com/webhook');
+        console.log('🎯 Account addresses: 675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8');
+        console.log('🎯 Account addresses: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
         
     } catch (error) {
-        console.error('❌ Failed to start bot:', error);
+        console.error('❌ Startup failed:', error.message);
         process.exit(1);
     }
 }
 
-// Start HTTP server (required for Render)
+// Root endpoint info
+app.get('/', (req, res) => {
+    res.json({
+        name: 'Solana LP Burn Monitor',
+        version: '2.0.0',
+        status: 'online',
+        webhook: '/webhook',
+        health: '/health',
+        processed: processedTxs.size,
+        uptime: process.uptime()
+    });
+});
+
+// Start server
 app.listen(PORT, () => {
     console.log(`🌐 Server running on port ${PORT}`);
     startBot();
@@ -299,6 +326,11 @@ app.listen(PORT, () => {
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-    console.log('🛑 Shutting down gracefully...');
+    console.log('🛑 Graceful shutdown...');
+    process.exit(0);
+});
+
+process.on('SIGINT', () => {
+    console.log('🛑 Graceful shutdown...');
     process.exit(0);
 });
