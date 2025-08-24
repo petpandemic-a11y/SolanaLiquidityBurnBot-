@@ -1,4 +1,27 @@
-const express = require('express');
+// Send LP burn alert
+async function sendLPBurnAlert(burnInfo) {
+    let marketCapText = 'N/A';
+    if (burnInfo.marketcap && burnInfo.marketcap > 0) {
+        if (burnInfo.marketcap >= 1000000) {
+            marketCapText = `${(burnInfo.marketcap / 1000000).toFixed(1)}M`;
+        } else if (burnInfo.marketcap >= 1000) {
+            marketCapText = `${(burnInfo.marketcap / 1000).toFixed(0)}K`;
+        } else {
+            marketCapText = `${burnInfo.marketcap.toFixed(0)}`;
+        }
+    }
+    
+    const message = `
+🔥 **100% LP ELÉGETVE!** 🔥
+
+💰 **Token:** ${burnInfo.tokenName} (${burnInfo.tokenSymbol})
+🏷️ **Mint:** \`${burnInfo.mint}\`
+🔥 **Égetett tokens:** ${Math.round(burnInfo.burnedAmount).toLocaleString()}
+💎 **SOL égetve:** ${burnInfo.solBurned.toFixed(2)} SOL
+📊 **Market Cap:** ${marketCapText}
+⏰ **Időpont:** ${burnInfo.timestamp.toLocaleString('hu-HU')}
+
+✅ **TELJES MEME/SOL LP ELÉGETVE!**const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
@@ -8,7 +31,8 @@ const PORT = process.env.PORT || 3000;
 
 // Environment variables
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || process.env.TELEGRAM_CHAT_ID; // Private chat for commands
+const ALERT_CHAT_ID = process.env.ALERT_CHAT_ID || process.env.TELEGRAM_CHAT_ID; // Channel for alerts
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const RAYDIUM_PROGRAM = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 
@@ -19,7 +43,8 @@ let settings = {
     minMarketCap: 10000,          // Minimum $10K marketcap
     maxMarketCap: 50000000,       // Maximum $50M marketcap
     isActive: false,              // Monitor active/inactive
-    adminChatId: TELEGRAM_CHAT_ID // Admin chat ID
+    adminChatId: ADMIN_CHAT_ID,   // Private chat for commands
+    alertChatId: ALERT_CHAT_ID    // Channel for alerts
 };
 
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
@@ -36,6 +61,10 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     mode: 'polling',
     interval: '10 seconds',
+    chats: {
+      admin: settings.adminChatId,
+      alerts: settings.alertChatId
+    },
     settings,
     processed: processedTxs.size,
     timestamp: new Date().toISOString()
@@ -486,11 +515,11 @@ async function sendLPBurnAlert(burnInfo) {
     let marketCapText = 'N/A';
     if (burnInfo.marketcap && burnInfo.marketcap > 0) {
         if (burnInfo.marketcap >= 1000000) {
-            marketCapText = `$${(burnInfo.marketcap / 1000000).toFixed(1)}M`;
+            marketCapText = `${(burnInfo.marketcap / 1000000).toFixed(1)}M`;
         } else if (burnInfo.marketcap >= 1000) {
-            marketCapText = `$${(burnInfo.marketcap / 1000).toFixed(0)}K`;
+            marketCapText = `${(burnInfo.marketcap / 1000).toFixed(0)}K`;
         } else {
-            marketCapText = `$${burnInfo.marketcap.toFixed(0)}`;
+            marketCapText = `${burnInfo.marketcap.toFixed(0)}`;
         }
     }
     
@@ -516,65 +545,39 @@ async function sendLPBurnAlert(burnInfo) {
     `.trim();
 
     try {
-        await bot.sendMessage(settings.adminChatId, message, {
+        // Send alert to channel/group (not to admin private chat)
+        await bot.sendMessage(settings.alertChatId, message, {
             parse_mode: 'Markdown',
             disable_web_page_preview: false
         });
         
-        console.log(`✅ ALERT SENT: ${burnInfo.tokenSymbol} - ${burnInfo.solBurned.toFixed(2)} SOL burned`);
+        console.log(`✅ ALERT SENT to channel: ${burnInfo.tokenSymbol} - ${burnInfo.solBurned.toFixed(2)} SOL burned`);
+        
+        // Also notify admin privately about the alert
+        await bot.sendMessage(settings.adminChatId, `✅ **Alert küldve!**\n\n${burnInfo.tokenSymbol} LP burn alert elküldve a channelre.`);
+        
     } catch (error) {
         console.error('❌ Telegram alert error:', error.message);
+        
+        // Notify admin of the error
+        try {
+            await bot.sendMessage(settings.adminChatId, `❌ **Alert küldési hiba:**\n\n${error.message}`);
+        } catch (notifyError) {
+            console.error('Failed to notify admin of alert error:', notifyError.message);
+        }
     }
-}
+} 
+🛡️ **${burnInfo.solBurned.toFixed(2)} SOL** biztosan elégetve
+🚫 **Rug pull:** Már nem lehetséges!
+📊 **Tranzakció:** [Solscan](https://solscan.io/tx/${burnInfo.signature})
 
-// Start bot
-async function startBot() {
+🚀 **Biztonságos memecoin lehet!**
+⚠️ **DYOR:** Mindig végezz saját kutatást!
+
+#LPBurned #MemeSol #SafeToken #${burnInfo.tokenSymbol}
+    `.trim();
+
     try {
-        if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-            throw new Error('Missing Telegram configuration');
-        }
-
-        if (!HELIUS_API_KEY) {
-            throw new Error('Missing HELIUS_API_KEY');
-        }
-
-        const me = await bot.getMe();
-        console.log(`🤖 Telegram Bot ready: @${me.username}`);
-        
-        const version = await connection.getVersion();
-        console.log(`⚡ Helius RPC connected: ${version['solana-core']}`);
-        
-        console.log('🚀 LP Burn Monitor ready! Use /start to begin.');
-        
-    } catch (error) {
-        console.error('❌ Startup failed:', error.message);
-        process.exit(1);
-    }
-}
-
-// Root endpoint
-app.get('/', (req, res) => {
-    res.json({
-        name: 'Telegram LP Burn Monitor',
-        version: '3.0.0',
-        mode: 'polling',
-        interval: '10 seconds',
-        status: settings.isActive ? 'monitoring' : 'idle',
-        settings: settings,
-        processed: processedTxs.size,
-        instructions: 'Use Telegram bot commands to control monitoring'
-    });
-});
-
-// Start server
-app.listen(PORT, () => {
-    console.log(`🌐 Server running on port ${PORT}`);
-    startBot();
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-    console.log('🛑 Graceful shutdown...');
-    stopMonitoring();
-    process.exit(0);
-});
+        await bot.sendMessage(settings.adminChatId, message, {
+            parse_mode: 'Markdown',
+            disable_web_
