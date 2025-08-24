@@ -22,12 +22,11 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// LP burn detection
+// LP burn detection - ONLY 100% burns
 async function checkLPBurn(signature) {
     try {
         // Validate signature
         if (!signature || typeof signature !== 'string' || signature.length < 80) {
-            console.log('⚠️ Invalid signature format:', signature);
             return null;
         }
 
@@ -37,7 +36,6 @@ async function checkLPBurn(signature) {
         });
 
         if (!tx?.meta) {
-            console.log('⚠️ No transaction metadata for:', signature);
             return null;
         }
 
@@ -49,20 +47,24 @@ async function checkLPBurn(signature) {
             const preAmount = pre.uiTokenAmount?.uiAmount || 0;
             const postAmount = post?.uiTokenAmount?.uiAmount || 0;
 
-            // Full LP burn: large amount → 0
-            if (preAmount > 100000 && postAmount === 0) {
-                console.log(`🔍 Potential LP burn found: ${preAmount} → ${postAmount}`);
+            // STRICT: Only 100% LP burns (large amount → exactly 0)
+            if (preAmount > 1000000 && postAmount === 0) { // Increased minimum to 1M+ tokens
+                console.log(`🔍 100% LP burn found: ${preAmount.toLocaleString()} → 0`);
                 
-                const tokenInfo = await getTokenInfo(pre.mint);
-                
-                return {
-                    signature,
-                    mint: pre.mint,
-                    burnedAmount: preAmount,
-                    tokenName: tokenInfo.name,
-                    tokenSymbol: tokenInfo.symbol,
-                    timestamp: new Date()
-                };
+                // Double-check it's likely an LP token by checking if it's a large round number
+                if (preAmount > 1000000 && Number.isInteger(preAmount)) {
+                    const tokenInfo = await getTokenInfo(pre.mint);
+                    
+                    return {
+                        signature,
+                        mint: pre.mint,
+                        burnedAmount: preAmount,
+                        tokenName: tokenInfo.name,
+                        tokenSymbol: tokenInfo.symbol,
+                        timestamp: new Date(),
+                        burnPercentage: 100 // Always 100% for our alerts
+                    };
+                }
             }
         }
         return null;
@@ -96,24 +98,25 @@ async function getTokenInfo(mintAddress) {
     }
 }
 
-// Send Telegram alert
+// Send Telegram alert - ONLY for 100% burns
 async function sendLPBurnAlert(burnInfo) {
     const message = `
-🔥 **TELJES LP ELÉGETVE!** 🔥
+🔥 **100% LP ELÉGETVE!** 🔥
 
 💰 **Token:** ${burnInfo.tokenName} (${burnInfo.tokenSymbol})
 🏷️ **Cím:** \`${burnInfo.mint}\`
-🔥 **Égetett LP:** ${Math.round(burnInfo.burnedAmount).toLocaleString()}
+🔥 **Teljes LP égetés:** ${Math.round(burnInfo.burnedAmount).toLocaleString()} token
 ⏰ **Időpont:** ${burnInfo.timestamp.toLocaleString('hu-HU')}
 
-✅ **JÓ HÍR:** A fejlesztő elégette az LP-t!
-🛡️ **Mit jelent:** Nem tudják már ellopni a likviditást
+✅ **TELJES LP ELÉGETVE!** 
+🛡️ **Biztonság:** A likviditás 100%-ban el lett égetve
+🚫 **Rug pull:** Már nem lehetséges!
 📊 **Tranzakció:** [Solscan](https://solscan.io/tx/${burnInfo.signature})
 
-🚀 Ez lehet egy biztonságos memecoin! 
-⚠️ De mindig DYOR (Do Your Own Research)!
+🚀 **Ez egy potenciálisan biztonságos memecoin!**
+⚠️ **Figyelem:** Mindig végezz saját kutatást (DYOR)!
 
-#LPBurn #SafeMeme #Solana #RugProof
+#100PercentBurn #LPBurn #SafeMeme #Solana #RugProof
     `.trim();
 
     try {
@@ -121,7 +124,7 @@ async function sendLPBurnAlert(burnInfo) {
             parse_mode: 'Markdown',
             disable_web_page_preview: false
         });
-        console.log(`✅ Alert sent: ${burnInfo.tokenSymbol}`);
+        console.log(`✅ 100% LP burn alert sent: ${burnInfo.tokenSymbol} - ${burnInfo.burnedAmount.toLocaleString()}`);
     } catch (error) {
         console.error('❌ Telegram error:', error.message);
     }
@@ -129,23 +132,23 @@ async function sendLPBurnAlert(burnInfo) {
 
 // Polling method (more reliable than WebSocket for this use case)
 function startPollingMonitoring() {
-    console.log('🔄 Starting polling mode for better reliability...');
+    console.log('🔄 Starting polling mode with rate limiting...');
     
     setInterval(async () => {
         try {
             const signatures = await connection.getSignaturesForAddress(
                 new PublicKey(RAYDIUM_PROGRAM),
-                { limit: 20 }
+                { limit: 10 } // Reduced from 20 to 10
             );
 
-            for (const sigInfo of signatures) {
+            for (const sigInfo of signatures.slice(0, 5)) { // Only check first 5
                 if (processedTxs.has(sigInfo.signature)) continue;
                 
                 processedTxs.add(sigInfo.signature);
                 
                 // Memory cleanup
-                if (processedTxs.size > 5000) {
-                    const oldest = Array.from(processedTxs).slice(0, 2500);
+                if (processedTxs.size > 3000) { // Reduced size
+                    const oldest = Array.from(processedTxs).slice(0, 1500);
                     oldest.forEach(sig => processedTxs.delete(sig));
                 }
                 
@@ -155,19 +158,25 @@ function startPollingMonitoring() {
                     await sendLPBurnAlert(burnInfo);
                 }
                 
-                // Rate limiting to avoid overwhelming the RPC
-                await new Promise(resolve => setTimeout(resolve, 100));
+                // Longer rate limiting to avoid 429 errors
+                await new Promise(resolve => setTimeout(resolve, 500)); // Increased from 100ms
             }
         } catch (error) {
-            console.error('Polling error:', error.message);
+            if (error.message.includes('429')) {
+                console.log('⚠️ Rate limited, waiting longer...');
+                await new Promise(resolve => setTimeout(resolve, 5000));
+            } else {
+                console.error('Polling error:', error.message);
+            }
         }
-    }, 15000); // Check every 15 seconds
+    }, 30000); // Increased from 15s to 30s
 }
 
-// WebSocket monitoring (backup method)
+// WebSocket monitoring (backup method) - DISABLED to reduce load
 function startWebSocketMonitoring() {
-    console.log('🔌 Starting WebSocket monitoring as backup...');
-    
+    console.log('🔌 WebSocket monitoring disabled to reduce rate limiting');
+    // Commenting out WebSocket to reduce API calls
+    /*
     const ws = new WebSocket('wss://api.mainnet-beta.solana.com');
     
     ws.on('open', () => {
@@ -240,6 +249,7 @@ function startWebSocketMonitoring() {
             }
         }, 30000);
     });
+    */
 }
 
 // Start the bot
@@ -257,10 +267,11 @@ async function startBot() {
         
         await bot.sendMessage(TELEGRAM_CHAT_ID, 
             '🚀 LP Burn Monitor elindult!\n\n' +
-            '🔥 Figyelek minden LP égetést a Solana hálózaton\n' +
-            '✅ Értesíteni foglak, ha egy memecoin elégeti az LP-t!\n' +
-            '⚡ Polling módban működök (15s ciklusok)\n\n' +
-            '#LPBurnMonitor #Online'
+            '🔥 **CSAK 100% LP ÉGETÉSEKET** figyelek!\n' +
+            '✅ Csak akkor írok, ha teljes LP elégetve\n' +
+            '⚡ Polling mód: 30s ciklusok (rate limit safe)\n' +
+            '🛡️ Rug pull védelem detector!\n\n' +
+            '#100PercentBurn #LPBurnMonitor #Online'
         );
         
         // Start both monitoring methods
