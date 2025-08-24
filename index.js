@@ -27,6 +27,7 @@ let settings = {
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, 'confirmed');
 const processedTxs = new Set();
+const tokenInfoCache = new Map(); // Cache for token info to save API calls
 let monitorInterval;
 
 // Middleware
@@ -282,9 +283,9 @@ function startMonitoring() {
         clearInterval(monitorInterval);
     }
     
-    console.log('🚀 Starting LP burn monitoring every 30 SECONDS with 5-minute window...');
+    console.log('🚀 Starting LP burn monitoring every 60 SECONDS with credit optimization...');
     checkForLPBurns();
-    monitorInterval = setInterval(checkForLPBurns, 30 * 1000); // 30 seconds instead of 10
+    monitorInterval = setInterval(checkForLPBurns, 60 * 1000); // 60 seconds to save credits
 }
 
 function stopMonitoring() {
@@ -295,20 +296,20 @@ function stopMonitoring() {
     console.log('🛑 LP burn monitoring stopped');
 }
 
-// Check for LP burns in last 5 MINUTES (for testing)
+// Check for LP burns in last 5 MINUTES (credit optimized)
 async function checkForLPBurns() {
     if (!settings.isActive) return;
     
     try {
-        console.log('🔍 Checking for LP burns in last 5 MINUTES...');
+        console.log('🔍 Checking for LP burns in last 5 MINUTES... (credit optimized)');
         
         const signatures = await connection.getSignaturesForAddress(
             new PublicKey(RAYDIUM_PROGRAM),
-            { limit: 50 } // More signatures
+            { limit: 25 } // Reduced from 50 to 25 to save credits
         );
         
         const now = Date.now();
-        const fiveMinutesAgo = now - (5 * 60 * 1000); // 5 minutes instead of 10 seconds
+        const fiveMinutesAgo = now - (5 * 60 * 1000);
         
         let checkedCount = 0;
         let newTransactions = 0;
@@ -344,12 +345,12 @@ async function checkForLPBurns() {
                 debugInfo.push(`${sigInfo.signature.slice(0, 8)}: No LP burn detected`);
             }
             
-            await new Promise(resolve => setTimeout(resolve, 100)); // Slower to avoid rate limits
+            await new Promise(resolve => setTimeout(resolve, 200)); // Slower to avoid rate limits and save credits
         }
         
-        console.log(`✅ Checked ${checkedCount} new transactions in last 5 minutes`);
+        console.log(`✅ Checked ${checkedCount} new transactions (Credit usage optimized: ${checkedCount} getTransaction calls)`);
         if (debugInfo.length > 0) {
-            console.log(`📊 Debug info: ${debugInfo.slice(0, 3).join(', ')}`);
+            console.log(`📊 Debug info: ${debugInfo.slice(0, 2).join(', ')}`);
         }
         
     } catch (error) {
