@@ -1,27 +1,4 @@
-// Send LP burn alert
-async function sendLPBurnAlert(burnInfo) {
-    let marketCapText = 'N/A';
-    if (burnInfo.marketcap && burnInfo.marketcap > 0) {
-        if (burnInfo.marketcap >= 1000000) {
-            marketCapText = `${(burnInfo.marketcap / 1000000).toFixed(1)}M`;
-        } else if (burnInfo.marketcap >= 1000) {
-            marketCapText = `${(burnInfo.marketcap / 1000).toFixed(0)}K`;
-        } else {
-            marketCapText = `${burnInfo.marketcap.toFixed(0)}`;
-        }
-    }
-    
-    const message = `
-🔥 **100% LP ELÉGETVE!** 🔥
-
-💰 **Token:** ${burnInfo.tokenName} (${burnInfo.tokenSymbol})
-🏷️ **Mint:** \`${burnInfo.mint}\`
-🔥 **Égetett tokens:** ${Math.round(burnInfo.burnedAmount).toLocaleString()}
-💎 **SOL égetve:** ${burnInfo.solBurned.toFixed(2)} SOL
-📊 **Market Cap:** ${marketCapText}
-⏰ **Időpont:** ${burnInfo.timestamp.toLocaleString('hu-HU')}
-
-✅ **TELJES MEME/SOL LP ELÉGETVE!**const express = require('express');
+const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
