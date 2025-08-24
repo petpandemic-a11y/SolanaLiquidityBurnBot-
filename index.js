@@ -1,6 +1,6 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
-const { Connection } = require('@solana/web3.js');
+const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
 
 const app = express();
@@ -10,444 +10,477 @@ const PORT = process.env.PORT || 3000;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'secret-key';
+const RAYDIUM_PROGRAM = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 
-// Filtering settings (configurable via environment)
-const MIN_SOL_BURNED = parseFloat(process.env.MIN_SOL_BURNED) || 5; // Minimum SOL burned
-const MIN_MARKETCAP = parseFloat(process.env.MIN_MARKETCAP) || 10000; // Minimum $10k marketcap
-const MAX_MARKETCAP = parseFloat(process.env.MAX_MARKETCAP) || 50000000; // Maximum $50M marketcap
-const MIN_TOKEN_BURNED = parseFloat(process.env.MIN_TOKEN_BURNED) || 1000000; // Minimum tokens burned
+// Bot settings (stored in memory, configurable via Telegram)
+let settings = {
+    minSOL: 5,                    // Minimum SOL burned
+    minTokens: 1000000,           // Minimum tokens burned
+    minMarketCap: 10000,          // Minimum $10K marketcap
+    maxMarketCap: 50000000,       // Maximum $50M marketcap
+    isActive: false,              // Monitor active/inactive
+    adminChatId: TELEGRAM_CHAT_ID // Admin chat ID
+};
 
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 const connection = new Connection(`https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`, 'confirmed');
 const processedTxs = new Set();
+let monitorInterval;
 
 // Middleware
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json());
 
 // Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    timestamp: new Date().toISOString(),
-    processed: processedTxs.size
+    settings,
+    processed: processedTxs.size,
+    timestamp: new Date().toISOString()
   });
 });
 
-// Helius Webhook endpoint
-app.post('/webhook', async (req, res) => {
-    try {
-        console.log('📡 Webhook received from Helius');
-        
-        const webhookData = req.body;
-        
-        // Debug: Log webhook structure
-        console.log('🔍 Webhook data keys:', Object.keys(webhookData));
-        if (webhookData[0]) {
-            console.log('🔍 First transaction keys:', Object.keys(webhookData[0]));
-            if (webhookData[0].tokenTransfers) {
-                console.log('🔍 Token transfers count:', webhookData[0].tokenTransfers.length);
-            }
-        }
-        
-        if (Array.isArray(webhookData)) {
-            for (const txData of webhookData) {
-                await processTransaction(txData);
-            }
-        } else if (webhookData) {
-            await processTransaction(webhookData);
-        }
-
-        res.status(200).json({ status: 'processed' });
-    } catch (error) {
-        console.error('❌ Webhook error:', error.message);
-        res.status(500).json({ error: 'Processing failed' });
+// Telegram Bot Commands
+bot.onText(/\/start/, async (msg) => {
+    const chatId = msg.chat.id;
+    
+    if (chatId.toString() !== settings.adminChatId) {
+        bot.sendMessage(chatId, '⛔ Unauthorized access');
+        return;
     }
+    
+    const welcomeMsg = `
+🚀 **LP Burn Monitor Bot**
+
+**Parancsok:**
+/settings - Jelenlegi beállítások
+/setsol <érték> - Min SOL beállítás (pl: /setsol 10)
+/setminmc <érték> - Min MarketCap (pl: /setminmc 50000)  
+/setmaxmc <érték> - Max MarketCap (pl: /setmaxmc 10000000)
+/start_monitor - Monitoring indítás
+/stop_monitor - Monitoring megállítás
+/status - Bot állapot
+/help - Súgó
+
+**Jelenlegi beállítások:**
+💎 Min SOL: ${settings.minSOL} SOL
+📊 Min MC: $${settings.minMarketCap.toLocaleString()}
+📈 Max MC: $${settings.maxMarketCap.toLocaleString()}
+⚡ Aktív: ${settings.isActive ? '✅' : '❌'}
+    `;
+    
+    bot.sendMessage(chatId, welcomeMsg, { parse_mode: 'Markdown' });
 });
 
-// Process transaction from webhook
-async function processTransaction(txData) {
-    try {
-        const signature = txData.signature;
-        
-        if (!signature || processedTxs.has(signature)) {
-            return;
-        }
-        
-        processedTxs.add(signature);
-        console.log(`🔍 Processing: ${signature.slice(0, 8)}...`);
-        
-        // Memory cleanup
-        if (processedTxs.size > 2000) {
-            const oldest = Array.from(processedTxs).slice(0, 1000);
-            oldest.forEach(sig => processedTxs.delete(sig));
-        }
+bot.onText(/\/settings/, async (msg) => {
+    const chatId = msg.chat.id;
+    
+    if (chatId.toString() !== settings.adminChatId) return;
+    
+    const settingsMsg = `
+⚙️ **Jelenlegi beállítások:**
 
-        const burnInfo = await checkForLPBurn(txData);
+💎 **Min SOL égetve:** ${settings.minSOL} SOL
+🔢 **Min tokens égetve:** ${settings.minTokens.toLocaleString()}
+📊 **Min MarketCap:** $${settings.minMarketCap.toLocaleString()}
+📈 **Max MarketCap:** $${settings.maxMarketCap.toLocaleString()}
+⚡ **Monitor állapot:** ${settings.isActive ? '🟢 Aktív' : '🔴 Inaktív'}
+⏰ **Ellenőrzés:** 10 percenként
+📊 **Feldolgozott tx:** ${processedTxs.size}
+
+**Parancsok a módosításhoz:**
+/setsol 10 - Min SOL beállítás
+/setminmc 25000 - Min MarketCap
+/setmaxmc 5000000 - Max MarketCap
+    `;
+    
+    bot.sendMessage(chatId, settingsMsg, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/setsol (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    
+    if (chatId.toString() !== settings.adminChatId) return;
+    
+    const newValue = parseFloat(match[1]);
+    
+    if (isNaN(newValue) || newValue <= 0 || newValue > 1000) {
+        bot.sendMessage(chatId, '❌ Érvénytelen érték! Használj 0.1 és 1000 közötti számot.');
+        return;
+    }
+    
+    settings.minSOL = newValue;
+    bot.sendMessage(chatId, `✅ Min SOL frissítve: ${settings.minSOL} SOL`);
+});
+
+bot.onText(/\/setminmc (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    
+    if (chatId.toString() !== settings.adminChatId) return;
+    
+    const newValue = parseFloat(match[1]);
+    
+    if (isNaN(newValue) || newValue < 0 || newValue > 100000000) {
+        bot.sendMessage(chatId, '❌ Érvénytelen érték! Használj 0 és 100M közötti számot.');
+        return;
+    }
+    
+    settings.minMarketCap = newValue;
+    bot.sendMessage(chatId, `✅ Min MarketCap frissítve: $${settings.minMarketCap.toLocaleString()}`);
+});
+
+bot.onText(/\/setmaxmc (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    
+    if (chatId.toString() !== settings.adminChatId) return;
+    
+    const newValue = parseFloat(match[1]);
+    
+    if (isNaN(newValue) || newValue < 1000 || newValue > 1000000000) {
+        bot.sendMessage(chatId, '❌ Érvénytelen érték! Használj 1K és 1B közötti számot.');
+        return;
+    }
+    
+    settings.maxMarketCap = newValue;
+    bot.sendMessage(chatId, `✅ Max MarketCap frissítve: $${settings.maxMarketCap.toLocaleString()}`);
+});
+
+bot.onText(/\/start_monitor/, async (msg) => {
+    const chatId = msg.chat.id;
+    
+    if (chatId.toString() !== settings.adminChatId) return;
+    
+    if (settings.isActive) {
+        bot.sendMessage(chatId, '⚠️ Monitor már aktív!');
+        return;
+    }
+    
+    settings.isActive = true;
+    startMonitoring();
+    
+    bot.sendMessage(chatId, `
+✅ **Monitor elindítva!**
+
+📊 **Beállítások:**
+💎 Min SOL: ${settings.minSOL} SOL
+📈 Min MC: $${settings.minMarketCap.toLocaleString()}
+📉 Max MC: $${settings.maxMarketCap.toLocaleString()}
+⏰ **Ellenőrzés:** 10 percenként
+
+🔍 Keresem a meme/SOL LP burnokat...
+    `, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/stop_monitor/, async (msg) => {
+    const chatId = msg.chat.id;
+    
+    if (chatId.toString() !== settings.adminChatId) return;
+    
+    if (!settings.isActive) {
+        bot.sendMessage(chatId, '⚠️ Monitor már inaktív!');
+        return;
+    }
+    
+    settings.isActive = false;
+    stopMonitoring();
+    
+    bot.sendMessage(chatId, '🛑 **Monitor megállítva**');
+});
+
+bot.onText(/\/status/, async (msg) => {
+    const chatId = msg.chat.id;
+    
+    if (chatId.toString() !== settings.adminChatId) return;
+    
+    const statusMsg = `
+📊 **Bot állapot:**
+
+⚡ **Monitor:** ${settings.isActive ? '🟢 Aktív' : '🔴 Inaktív'}
+🔢 **Feldolgozott tx:** ${processedTxs.size}
+⏰ **Uptime:** ${Math.round(process.uptime() / 60)} perc
+💾 **Memory:** ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)} MB
+
+**Utolsó 5 feldolgozott:**
+${Array.from(processedTxs).slice(-5).map(tx => `• ${tx.slice(0, 8)}...`).join('\n') || 'Nincs adat'}
+
+**Következő ellenőrzés:** ${settings.isActive ? 'Max 10 perc' : 'Monitor leállítva'}
+    `;
+    
+    bot.sendMessage(chatId, statusMsg, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/help/, async (msg) => {
+    const chatId = msg.chat.id;
+    
+    if (chatId.toString() !== settings.adminChatId) return;
+    
+    const helpMsg = `
+📖 **LP Burn Monitor Súgó**
+
+**Fő parancsok:**
+/start - Indítás és alapparancsok
+/settings - Jelenlegi beállítások megtekintése
+/start_monitor - LP burn monitoring indítása
+/stop_monitor - Monitoring megállítása
+/status - Bot állapot és statisztikák
+
+**Beállítás parancsok:**
+/setsol <szám> - Min SOL mennyiség (pl: /setsol 2.5)
+/setminmc <szám> - Min MarketCap dollárban (pl: /setminmc 50000)
+/setmaxmc <szám> - Max MarketCap dollárban (pl: /setmaxmc 10000000)
+
+**Példák:**
+/setsol 10 → Csak 10+ SOL burnokat mutat
+/setminmc 100000 → Csak $100K+ MC tokeneket
+/setmaxmc 5000000 → Csak $5M alatti MC tokeneket
+
+**Működés:**
+• 10 percenként ellenőriz Helius API-n keresztül
+• Csak meme/SOL LP burnokat keres
+• MarketCap adatok DexScreener-ről
+• Instant Telegram értesítés
+    `;
+    
+    bot.sendMessage(chatId, helpMsg, { parse_mode: 'Markdown' });
+});
+
+// Monitoring functions
+function startMonitoring() {
+    if (monitorInterval) {
+        clearInterval(monitorInterval);
+    }
+    
+    console.log('🚀 Starting LP burn monitoring every 10 minutes...');
+    
+    // Run immediately, then every 10 minutes
+    checkForLPBurns();
+    monitorInterval = setInterval(checkForLPBurns, 10 * 60 * 1000); // 10 minutes
+}
+
+function stopMonitoring() {
+    if (monitorInterval) {
+        clearInterval(monitorInterval);
+        monitorInterval = null;
+    }
+    console.log('🛑 LP burn monitoring stopped');
+}
+
+// Check for LP burns in last 10 minutes
+async function checkForLPBurns() {
+    if (!settings.isActive) return;
+    
+    try {
+        console.log('🔍 Checking for LP burns in last 10 minutes...');
         
-        if (burnInfo) {
-            console.log(`🔥 100% LP BURN: ${burnInfo.tokenSymbol} - ${burnInfo.burnedAmount.toLocaleString()}`);
-            await sendLPBurnAlert(burnInfo);
+        // Get signatures from last 10 minutes
+        const signatures = await connection.getSignaturesForAddress(
+            new PublicKey(RAYDIUM_PROGRAM),
+            { limit: 50 }
+        );
+        
+        const now = Date.now();
+        const tenMinutesAgo = now - (10 * 60 * 1000);
+        
+        let checkedCount = 0;
+        let newTransactions = 0;
+        
+        for (const sigInfo of signatures) {
+            // Check if transaction is from last 10 minutes
+            const txTime = sigInfo.blockTime * 1000;
+            if (txTime < tenMinutesAgo) {
+                console.log(`⏰ Transaction too old: ${new Date(txTime).toLocaleTimeString()}`);
+                break;
+            }
+            
+            if (processedTxs.has(sigInfo.signature)) {
+                continue;
+            }
+            
+            processedTxs.add(sigInfo.signature);
+            newTransactions++;
+            
+            // Memory cleanup
+            if (processedTxs.size > 2000) {
+                const oldest = Array.from(processedTxs).slice(0, 1000);
+                oldest.forEach(sig => processedTxs.delete(sig));
+            }
+            
+            const burnInfo = await checkTransactionForBurn(sigInfo.signature);
+            checkedCount++;
+            
+            if (burnInfo) {
+                console.log(`🔥 LP BURN FOUND: ${burnInfo.tokenSymbol} - ${burnInfo.solBurned} SOL`);
+                await sendLPBurnAlert(burnInfo);
+            }
+            
+            // Rate limiting - wait between checks
+            await new Promise(resolve => setTimeout(resolve, 200));
         }
+        
+        console.log(`✅ Scan complete: ${checkedCount} new transactions checked, ${newTransactions} total new`);
         
     } catch (error) {
-        console.error('Error processing transaction:', error.message);
+        console.error('❌ Error checking LP burns:', error.message);
+        
+        // Notify admin of errors
+        try {
+            await bot.sendMessage(settings.adminChatId, 
+                `❌ **Monitor hiba:**\n\n${error.message}\n\n⏰ ${new Date().toLocaleTimeString()}`
+            );
+        } catch (notifyError) {
+            console.error('Failed to notify admin of error:', notifyError.message);
+        }
     }
 }
 
-// Check for LP burn in transaction data
-async function checkForLPBurn(txData) {
+// Check individual transaction for LP burn
+async function checkTransactionForBurn(signature) {
     try {
-        const { signature, tokenTransfers, accountData } = txData;
+        const tx = await connection.getTransaction(signature, {
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0
+        });
+
+        if (!tx?.meta) return null;
+
+        const preBalances = tx.meta.preTokenBalances || [];
+        const postBalances = tx.meta.postTokenBalances || [];
         
-        // Check SOL burn amount first
-        const solBurned = await checkSOLBurnAmount(txData);
+        // Look for token burns and SOL in same transaction
+        let solBurned = 0;
+        let tokenBurnInfo = null;
         
-        if (solBurned < MIN_SOL_BURNED) {
-            console.log(`⚠️ SOL burned (${solBurned.toFixed(2)}) < minimum (${MIN_SOL_BURNED})`);
+        // Check for SOL transfers
+        if (tx.meta.preBalances && tx.meta.postBalances) {
+            for (let i = 0; i < tx.meta.preBalances.length; i++) {
+                const preBalance = tx.meta.preBalances[i];
+                const postBalance = tx.meta.postBalances[i];
+                const diff = (preBalance - postBalance) / 1e9; // Convert to SOL
+                
+                if (diff > 0.01) { // Meaningful SOL amount
+                    solBurned += diff;
+                }
+            }
+        }
+        
+        // Check for token burns
+        for (const pre of preBalances) {
+            const post = postBalances.find(p => p.accountIndex === pre.accountIndex);
+            const preAmount = pre.uiTokenAmount?.uiAmount || 0;
+            const postAmount = post?.uiTokenAmount?.uiAmount || 0;
+
+            // Large burn to zero
+            if (preAmount > settings.minTokens && postAmount === 0) {
+                // Skip known stablecoins
+                const skipTokens = [
+                    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+                    'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+                ];
+                
+                if (skipTokens.includes(pre.mint)) {
+                    continue;
+                }
+                
+                tokenBurnInfo = {
+                    mint: pre.mint,
+                    burnedAmount: preAmount
+                };
+                break;
+            }
+        }
+        
+        // Must have both token burn and SOL burn
+        if (!tokenBurnInfo || solBurned < settings.minSOL) {
             return null;
         }
         
-        // Method 1: Check token transfers for burns
-        if (tokenTransfers && Array.isArray(tokenTransfers)) {
-            for (const transfer of tokenTransfers) {
-                if (await isBurnTransfer(transfer)) {
-                    // Parse token amount properly
-                    let amount = 0;
-                    if (typeof transfer.tokenAmount === 'number') {
-                        amount = transfer.tokenAmount;
-                    } else if (typeof transfer.tokenAmount === 'string') {
-                        amount = parseFloat(transfer.tokenAmount);
-                    } else if (transfer.tokenAmount && transfer.tokenAmount.uiAmount) {
-                        amount = transfer.tokenAmount.uiAmount;
-                    }
-                    
-                    if (isNaN(amount) || amount < MIN_TOKEN_BURNED) {
-                        continue;
-                    }
-                    
-                    console.log(`🎯 Potential LP BURN: ${amount.toLocaleString()} tokens, ${solBurned.toFixed(2)} SOL`);
-                    
-                    // Get token info and marketcap
-                    const tokenInfo = await getTokenInfoAndMarketcap(transfer.mint);
-                    
-                    // Check marketcap filter
-                    if (tokenInfo.marketcap > 0 && 
-                        (tokenInfo.marketcap < MIN_MARKETCAP || tokenInfo.marketcap > MAX_MARKETCAP)) {
-                        console.log(`⚠️ Marketcap (${tokenInfo.marketcap.toLocaleString()}) outside range: ${MIN_MARKETCAP.toLocaleString()} - ${MAX_MARKETCAP.toLocaleString()}`);
-                        return null;
-                    }
-                    
-                    console.log(`🔥 LP BURN CONFIRMED: ${tokenInfo.symbol} - MC: ${tokenInfo.marketcap.toLocaleString()}`);
-                    
-                    return {
-                        signature,
-                        mint: transfer.mint,
-                        burnedAmount: amount,
-                        solBurned: solBurned,
-                        tokenName: tokenInfo.name,
-                        tokenSymbol: tokenInfo.symbol,
-                        marketcap: tokenInfo.marketcap,
-                        timestamp: new Date()
-                    };
-                }
+        console.log(`🎯 Potential LP burn: ${tokenBurnInfo.burnedAmount.toLocaleString()} tokens + ${solBurned.toFixed(2)} SOL`);
+        
+        // Get token info and marketcap
+        const tokenInfo = await getTokenInfoAndMarketcap(tokenBurnInfo.mint);
+        
+        // Check marketcap filter
+        if (tokenInfo.marketcap > 0) {
+            if (tokenInfo.marketcap < settings.minMarketCap || tokenInfo.marketcap > settings.maxMarketCap) {
+                console.log(`⚠️ Marketcap (${tokenInfo.marketcap.toLocaleString()}) outside range`);
+                return null;
             }
         }
-
-        // Method 2: Check account balance changes
-        if (accountData && Array.isArray(accountData)) {
-            for (const account of accountData) {
-                if (account.tokenBalanceChanges) {
-                    for (const change of account.tokenBalanceChanges) {
-                        if (await isBurnBalanceChange(change)) {
-                            const burnAmount = Math.abs(parseFloat(change.tokenBalanceChange) || 0);
-                            
-                            if (isNaN(burnAmount) || burnAmount < MIN_TOKEN_BURNED) {
-                                continue;
-                            }
-                            
-                            console.log(`🎯 Potential LP BURN via balance: ${burnAmount.toLocaleString()} tokens, ${solBurned.toFixed(2)} SOL`);
-                            
-                            // Get token info and marketcap
-                            const tokenInfo = await getTokenInfoAndMarketcap(change.mint);
-                            
-                            // Check marketcap filter
-                            if (tokenInfo.marketcap > 0 && 
-                                (tokenInfo.marketcap < MIN_MARKETCAP || tokenInfo.marketcap > MAX_MARKETCAP)) {
-                                console.log(`⚠️ Marketcap (${tokenInfo.marketcap.toLocaleString()}) outside range`);
-                                return null;
-                            }
-                            
-                            console.log(`🔥 LP BURN CONFIRMED via balance: ${tokenInfo.symbol}`);
-                            
-                            return {
-                                signature,
-                                mint: change.mint,
-                                burnedAmount: burnAmount,
-                                solBurned: solBurned,
-                                tokenName: tokenInfo.name,
-                                tokenSymbol: tokenInfo.symbol,
-                                marketcap: tokenInfo.marketcap,
-                                timestamp: new Date()
-                            };
-                        }
-                    }
-                }
-            }
-        }
-
-        return null;
+        
+        return {
+            signature,
+            mint: tokenBurnInfo.mint,
+            burnedAmount: tokenBurnInfo.burnedAmount,
+            solBurned: solBurned,
+            tokenName: tokenInfo.name,
+            tokenSymbol: tokenInfo.symbol,
+            marketcap: tokenInfo.marketcap,
+            timestamp: new Date()
+        };
+        
     } catch (error) {
-        console.error('LP burn check error:', error.message);
+        console.error(`Error checking transaction ${signature}:`, error.message);
         return null;
     }
 }
 
-// Check if transfer is a burn (to null address or burn address)
-async function isBurnTransfer(transfer) {
-    const { toTokenAccount, tokenAmount, fromTokenAccount, mint } = transfer;
-    
-    // Skip known stablecoins and major tokens
-    const skipTokens = [
-        'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
-        'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT  
-        'So11111111111111111111111111111111111111112',   // SOL
-        '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R', // RAY
-        'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So'   // mSOL
-    ];
-    
-    if (skipTokens.includes(mint)) {
-        console.log(`⚠️ Skipping known token: ${mint.slice(0, 8)}...`);
-        return false;
-    }
-    
-    // Parse token amount properly
-    let amount = 0;
-    if (typeof tokenAmount === 'number') {
-        amount = tokenAmount;
-    } else if (typeof tokenAmount === 'string') {
-        amount = parseFloat(tokenAmount);
-    } else if (tokenAmount && tokenAmount.uiAmount) {
-        amount = tokenAmount.uiAmount;
-    }
-    
-    // Must be substantial amount
-    if (isNaN(amount) || amount < MIN_TOKEN_BURNED) {
-        console.log(`⚠️ Amount too small: ${amount} < ${MIN_TOKEN_BURNED}`);
-        return false;
-    }
-    
-    // Check if burned (sent to null or burn addresses)
-    const burnAddresses = [
-        null,
-        undefined,
-        '11111111111111111111111111111111',
-        '1111111111111111111111111111111',
-        '',
-        '0x0'
-    ];
-    
-    const isBurnAddress = !toTokenAccount || 
-                         burnAddresses.includes(toTokenAccount) ||
-                         toTokenAccount.includes('1111111111111111');
-    
-    console.log(`🔍 Transfer check: ${amount.toLocaleString()} tokens, burn: ${isBurnAddress}`);
-    return isBurnAddress && amount >= MIN_TOKEN_BURNED;
-}
-
-// Check if this is a SOL/Memecoin LP burn
-async function checkSOLBurnAmount(txData) {
-    try {
-        const { tokenTransfers } = txData;
-        
-        if (!tokenTransfers || !Array.isArray(tokenTransfers)) {
-            return 0;
-        }
-        
-        // Look for SOL transfers in the same transaction
-        let solBurned = 0;
-        
-        for (const transfer of tokenTransfers) {
-            // Check if this is SOL (wrapped SOL mint)
-            if (transfer.mint === 'So11111111111111111111111111111111111111112') {
-                // Parse SOL amount
-                let amount = 0;
-                if (typeof transfer.tokenAmount === 'number') {
-                    amount = transfer.tokenAmount / 1e9; // Convert from lamports to SOL
-                } else if (transfer.tokenAmount && transfer.tokenAmount.uiAmount) {
-                    amount = transfer.tokenAmount.uiAmount;
-                }
-                
-                solBurned += amount;
-            }
-        }
-        
-        console.log(`💰 SOL burned in transaction: ${solBurned.toFixed(2)} SOL`);
-        return solBurned;
-    } catch (error) {
-        console.error('Error checking SOL burn amount:', error.message);
-        return 0;
-    }
-}
-
-// Check if balance change indicates burn
-async function isBurnBalanceChange(change) {
-    const { mint, tokenBalanceChange } = change;
-    
-    // Skip known stablecoins and major tokens
-    const skipTokens = [
-        'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
-        'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT  
-        'So11111111111111111111111111111111111111112',   // SOL
-        '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R', // RAY
-        'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So'   // mSOL
-    ];
-    
-    if (skipTokens.includes(mint)) {
-        console.log(`⚠️ Skipping known token balance change: ${mint.slice(0, 8)}...`);
-        return false;
-    }
-    
-    // Parse balance change
-    let balanceChange = 0;
-    if (typeof tokenBalanceChange === 'number') {
-        balanceChange = tokenBalanceChange;
-    } else if (typeof tokenBalanceChange === 'string') {
-        balanceChange = parseFloat(tokenBalanceChange);
-    }
-    
-    // Large negative change (tokens removed/burned)
-    const burnAmount = Math.abs(balanceChange);
-    
-    // Must be substantial burn (negative change, meets minimum)
-    if (balanceChange >= 0 || isNaN(burnAmount) || burnAmount < MIN_TOKEN_BURNED) {
-        console.log(`⚠️ Balance change not a burn: ${balanceChange} (min: ${MIN_TOKEN_BURNED})`);
-        return false;
-    }
-    
-    console.log(`🔍 Balance change: ${balanceChange.toLocaleString()} (burn: ${burnAmount.toLocaleString()})`);
-    return true;
-}
-
-// Get token info and marketcap using multiple APIs
+// Get token info and marketcap
 async function getTokenInfoAndMarketcap(mintAddress) {
     try {
-        console.log(`📖 Getting token info for: ${mintAddress}`);
+        let tokenInfo = { name: 'Unknown Token', symbol: 'UNKNOWN', marketcap: 0 };
         
-        let tokenInfo = { name: 'Unknown Memecoin', symbol: 'MEME', marketcap: 0 };
-        
-        // Try DexScreener for better token data and marketcap
+        // Try DexScreener first for marketcap
         try {
             const dexResponse = await axios.get(
                 `https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`,
                 { timeout: 5000 }
             );
             
-            if (dexResponse.data && dexResponse.data.pairs && dexResponse.data.pairs.length > 0) {
+            if (dexResponse.data?.pairs?.[0]) {
                 const pair = dexResponse.data.pairs[0];
-                const baseToken = pair.baseToken;
+                tokenInfo.name = pair.baseToken?.name || 'Unknown Token';
+                tokenInfo.symbol = pair.baseToken?.symbol || 'UNKNOWN';
+                tokenInfo.marketcap = parseFloat(pair.fdv) || 0;
                 
-                if (baseToken && baseToken.address === mintAddress) {
-                    tokenInfo.name = baseToken.name || 'Unknown Token';
-                    tokenInfo.symbol = baseToken.symbol || 'UNKNOWN';
-                    tokenInfo.marketcap = parseFloat(pair.fdv) || 0; // Fully diluted valuation
-                    
-                    console.log(`✅ DexScreener: ${tokenInfo.name} (${tokenInfo.symbol}) - MC: ${tokenInfo.marketcap.toLocaleString()}`);
-                    return tokenInfo;
-                }
+                console.log(`✅ DexScreener: ${tokenInfo.name} (${tokenInfo.symbol}) MC: $${tokenInfo.marketcap.toLocaleString()}`);
+                return tokenInfo;
             }
-        } catch (dexError) {
-            console.log('⚠️ DexScreener failed:', dexError.message);
+        } catch (error) {
+            console.log('⚠️ DexScreener failed:', error.message);
         }
         
-        // Try Helius for token metadata
-        try {
-            const heliusUrl = `https://api.helius.xyz/v0/token-metadata`;
-            const response = await axios.get(heliusUrl, {
-                params: { 
-                    'api-key': HELIUS_API_KEY,
-                    mint: mintAddress 
-                },
-                timeout: 5000
-            });
-            
-            if (response.data && response.data.length > 0) {
-                const token = response.data[0];
-                const onChain = token.onChainMetadata?.metadata;
-                const offChain = token.offChainMetadata;
-                
-                tokenInfo.name = onChain?.name || offChain?.name || 'Unknown Token';
-                tokenInfo.symbol = onChain?.symbol || offChain?.symbol || 'UNKNOWN';
-                
-                console.log(`✅ Helius: ${tokenInfo.name} (${tokenInfo.symbol})`);
-            }
-        } catch (heliusError) {
-            console.log('⚠️ Helius failed:', heliusError.message);
-        }
-        
-        // Try Jupiter as final fallback
+        // Fallback to Jupiter
         try {
             const jupiterResponse = await axios.get('https://token.jup.ag/strict', { timeout: 3000 });
-            const jupiterToken = jupiterResponse.data.find(t => t.address === mintAddress);
+            const token = jupiterResponse.data.find(t => t.address === mintAddress);
             
-            if (jupiterToken) {
-                tokenInfo.name = jupiterToken.name;
-                tokenInfo.symbol = jupiterToken.symbol;
-                console.log(`✅ Jupiter: ${tokenInfo.name} (${tokenInfo.symbol})`);
+            if (token) {
+                tokenInfo.name = token.name;
+                tokenInfo.symbol = token.symbol;
+                console.log(`✅ Jupiter fallback: ${tokenInfo.name} (${tokenInfo.symbol})`);
             }
-        } catch (jupiterError) {
-            console.log('⚠️ Jupiter failed:', jupiterError.message);
-        }
-        
-        // Try to get marketcap from CoinGecko if we have symbol
-        if (tokenInfo.marketcap === 0 && tokenInfo.symbol !== 'MEME') {
-            try {
-                const cgResponse = await axios.get(
-                    `https://api.coingecko.com/api/v3/search?query=${tokenInfo.symbol}`,
-                    { timeout: 3000 }
-                );
-                
-                if (cgResponse.data && cgResponse.data.coins && cgResponse.data.coins.length > 0) {
-                    const coin = cgResponse.data.coins[0];
-                    if (coin.market_cap_rank) {
-                        tokenInfo.marketcap = coin.market_cap || 0;
-                        console.log(`✅ CoinGecko marketcap: ${tokenInfo.marketcap.toLocaleString()}`);
-                    }
-                }
-            } catch (cgError) {
-                console.log('⚠️ CoinGecko failed:', cgError.message);
-            }
+        } catch (error) {
+            console.log('⚠️ Jupiter failed:', error.message);
         }
         
         return tokenInfo;
         
     } catch (error) {
-        console.error(`❌ Token info error for ${mintAddress}:`, error.message);
-        return { 
-            name: 'Unknown Memecoin', 
-            symbol: 'MEME',
-            marketcap: 0
-        };
+        console.error(`Token info error for ${mintAddress}:`, error.message);
+        return { name: 'Unknown Token', symbol: 'UNKNOWN', marketcap: 0 };
     }
 }
 
-// Send Telegram alert
+// Send LP burn alert
 async function sendLPBurnAlert(burnInfo) {
-    // Validate burnedAmount
-    if (isNaN(burnInfo.burnedAmount) || burnInfo.burnedAmount <= 0) {
-        console.error('❌ Invalid burnedAmount:', burnInfo.burnedAmount);
-        return;
-    }
-    
-    // Format marketcap display
     let marketCapText = 'N/A';
     if (burnInfo.marketcap && burnInfo.marketcap > 0) {
         if (burnInfo.marketcap >= 1000000) {
-            marketCapText = `${(burnInfo.marketcap / 1000000).toFixed(1)}M`;
+            marketCapText = `$${(burnInfo.marketcap / 1000000).toFixed(1)}M`;
         } else if (burnInfo.marketcap >= 1000) {
-            marketCapText = `${(burnInfo.marketcap / 1000).toFixed(0)}K`;
+            marketCapText = `$${(burnInfo.marketcap / 1000).toFixed(0)}K`;
         } else {
-            marketCapText = `${burnInfo.marketcap.toFixed(0)}`;
+            marketCapText = `$${burnInfo.marketcap.toFixed(0)}`;
         }
     }
     
@@ -456,55 +489,79 @@ async function sendLPBurnAlert(burnInfo) {
 
 💰 **Token:** ${burnInfo.tokenName} (${burnInfo.tokenSymbol})
 🏷️ **Mint:** \`${burnInfo.mint}\`
-🔥 **Égetett LP:** ${Math.round(burnInfo.burnedAmount).toLocaleString()} token
-💎 **SOL égetve:** ${burnInfo.solBurned?.toFixed(2) || 'N/A'} SOL
+🔥 **Égetett tokens:** ${Math.round(burnInfo.burnedAmount).toLocaleString()}
+💎 **SOL égetve:** ${burnInfo.solBurned.toFixed(2)} SOL
 📊 **Market Cap:** ${marketCapText}
 ⏰ **Időpont:** ${burnInfo.timestamp.toLocaleString('hu-HU')}
 
-✅ **TELJES LP ELÉGETVE!** 
-🛡️ **Biztonság:** A likviditás ${burnInfo.solBurned?.toFixed(2) || 'N/A'} SOL-lal együtt el lett égetve
+✅ **TELJES MEME/SOL LP ELÉGETVE!** 
+🛡️ **${burnInfo.solBurned.toFixed(2)} SOL** biztosan elégetve
 🚫 **Rug pull:** Már nem lehetséges!
 📊 **Tranzakció:** [Solscan](https://solscan.io/tx/${burnInfo.signature})
 
-🚀 **Potenciálisan biztonságos memecoin!**
+🚀 **Biztonságos memecoin lehet!**
 ⚠️ **DYOR:** Mindig végezz saját kutatást!
 
-#100PercentBurn #LPBurn #SafeMeme #Solana #RugProof #SOLBurned
+#LPBurned #MemeSol #SafeToken #${burnInfo.tokenSymbol}
     `.trim();
 
     try {
-        await bot.sendMessage(TELEGRAM_CHAT_ID, message, {
+        await bot.sendMessage(settings.adminChatId, message, {
             parse_mode: 'Markdown',
             disable_web_page_preview: false
         });
         
-        console.log(`✅ ALERT SENT: ${burnInfo.tokenSymbol} - ${burnInfo.burnedAmount.toLocaleString()} tokens, ${burnInfo.solBurned?.toFixed(2)} SOL`);
+        console.log(`✅ ALERT SENT: ${burnInfo.tokenSymbol} - ${burnInfo.solBurned.toFixed(2)} SOL burned`);
     } catch (error) {
-        console.error('❌ Telegram send error:', error.message);
-        
-        // Retry without markdown if failed
-        try {
-            const plainMessage = message.replace(/[*`_\[\]]/g, '');
-            await bot.sendMessage(TELEGRAM_CHAT_ID, plainMessage);
-            console.log('✅ Alert sent (plain text fallback)');
-        } catch (retryError) {
-            console.error('❌ Telegram retry failed:', retryError.message);
-        }
+        console.error('❌ Telegram alert error:', error.message);
     }
 }
 
-// Start the bot
+// Start bot
 async function startBot() {
     try {
-        // Validate environment variables
         if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-            throw new Error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
+            throw new Error('Missing Telegram configuration');
         }
 
         if (!HELIUS_API_KEY) {
             throw new Error('Missing HELIUS_API_KEY');
         }
 
-        // Test Telegram
         const me = await bot.getMe();
-      
+        console.log(`🤖 Telegram Bot ready: @${me.username}`);
+        
+        const version = await connection.getVersion();
+        console.log(`⚡ Helius RPC connected: ${version['solana-core']}`);
+        
+        console.log('🚀 LP Burn Monitor ready! Use /start to begin.');
+        
+    } catch (error) {
+        console.error('❌ Startup failed:', error.message);
+        process.exit(1);
+    }
+}
+
+// Root endpoint
+app.get('/', (req, res) => {
+    res.json({
+        name: 'Telegram LP Burn Monitor',
+        version: '3.0.0',
+        status: settings.isActive ? 'monitoring' : 'idle',
+        settings: settings,
+        processed: processedTxs.size
+    });
+});
+
+// Start server
+app.listen(PORT, () => {
+    console.log(`🌐 Server running on port ${PORT}`);
+    startBot();
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('🛑 Graceful shutdown...');
+    stopMonitoring();
+    process.exit(0);
+});
