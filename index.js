@@ -1,116 +1,149 @@
 import express from "express";
-import TelegramBot from "node-telegram-bot-api";
+import crypto from "crypto";
 import dotenv from "dotenv";
+import TelegramBot from "node-telegram-bot-api";
+import axios from "axios";
 
 dotenv.config();
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---- Környezetváltozók ----
+// --- ENV változók ---
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ALERT_CHAT_ID = process.env.ALERT_CHAT_ID;
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
-const HELIUS_WEBHOOK_SECRET = process.env.HELIUS_WEBHOOK_SECRET;
+const ALERT_CHAT_ID = process.env.ALERT_CHAT_ID;  // Csatorna vagy chat
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
-// LP pool program ID-k (Raydium, Orca, Jupiter)
-const LP_PROGRAMS = [
-    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", // Raydium
-    "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE", // Orca
-    "2ZnVuidTHpi5WWKUwFXauYGhvdT9jRKYv5MDahtbwtYr"  // Jupiter
-];
+if (!TELEGRAM_BOT_TOKEN || !ALERT_CHAT_ID || !HELIUS_API_KEY) {
+    console.error("❌ Hiányzó environment változók!");
+    process.exit(1);
+}
 
-// Burn címek → bárki ide küldi, az örökre elvész
-const BURN_ADDRESSES = [
-    "11111111111111111111111111111111", // Null address
-    "1nc1nerator11111111111111111111111111111", // Incinerator
-    "Burn111111111111111111111111111111111111111" // Burn address
-];
-
-// Telegram bot inicializálása
+// --- Telegram bot ---
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: false });
 
-// Middleware webhookhoz
-app.use(express.json({ limit: "5mb" }));
+// --- Express middleware ---
+app.use(
+    express.json({
+        verify: (req, res, buf) => {
+            req.rawBody = buf;
+        },
+    })
+);
 
-// Health check
-app.get("/health", (req, res) => {
-    res.json({
-        status: "ok",
-        mode: "webhook",
-        webhook: "/webhook",
-        burnAddresses: BURN_ADDRESSES.length,
-        lpPrograms: LP_PROGRAMS.length,
-        telegram: ALERT_CHAT_ID,
-        timestamp: new Date().toISOString(),
-    });
-});
-
-// ---- Helius webhook endpoint ----
+// --- Webhook végpont ---
 app.post("/webhook", async (req, res) => {
     try {
-        const event = req.body;
-
-        // Titkos kulcs ellenőrzése
-        const signature = req.headers["x-helius-signature"];
-        if (!signature || signature !== HELIUS_WEBHOOK_SECRET) {
-            console.log("❌ Helius webhook signature mismatch");
-            return res.status(403).send("Forbidden");
+        const heliusSig = req.headers["x-helius-signature"];
+        if (!heliusSig) {
+            console.warn("⚠️ Helius signature missing");
+            return res.status(401).send("Missing signature");
         }
 
-        if (!event || !event[0]?.transactions) {
-            return res.status(200).send("OK");
+        // Ellenőrizzük az aláírást
+        const computedSig = crypto
+            .createHmac("sha256", HELIUS_API_KEY)
+            .update(req.rawBody)
+            .digest("base64");
+
+        if (computedSig !== heliusSig) {
+            console.error("❌ Helius webhook signature mismatch!");
+            return res.status(401).send("Invalid signature");
         }
 
-        for (const tx of event[0].transactions) {
-            const sig = tx.signature;
-            const instructions = tx.transaction.message.instructions || [];
-            const accounts = tx.transaction.message.accountKeys || [];
+        const events = req.body;
+        console.log(`📩 Webhook események száma: ${events.length}`);
 
-            // Ellenőrizzük, hogy LP pool programból jött-e
-            const isFromLpProgram = accounts.some(a => LP_PROGRAMS.includes(a));
-            if (!isFromLpProgram) continue;
+        for (const event of events) {
+            if (!event || !event.transaction) continue;
 
-            // Ellenőrizzük, hogy burn címre ment-e
-            const burnTransfers = tx.tokenTransfers?.filter(t => 
-                BURN_ADDRESSES.includes(t.toUserAccount)
-            ) || [];
+            const txSig = event.transaction.signatures?.[0];
+            const instructions = event.transaction.message?.instructions || [];
 
-            if (burnTransfers.length === 0) continue;
+            // Csak LP égetéseket keressük (Raydium, Orca, Jupiter pool)
+            const isBurn = instructions.some(
+                (ix) =>
+                    ix.parsed?.type === "burn" ||
+                    ix.parsed?.type === "burnChecked" ||
+                    ix.program === "spl-token"
+            );
 
-            // Ha van token burn → megnézzük, hogy 100% LP ment-e el
-            for (const burn of burnTransfers) {
-                const preBalance = burn.tokenAmount.preAmount || 0;
-                const postBalance = burn.tokenAmount.postAmount || 0;
+            if (!isBurn) continue;
 
-                if (Number(postBalance) === 0 && Number(preBalance) > 0) {
-                    console.log(`🔥 100% LP burn detected! Tx: ${sig}`);
+            // Token info lekérés
+            const mint = instructions.find((ix) => ix.parsed?.info?.mint)?.parsed?.info?.mint;
 
-                    const message = `🔥 **100% LP BURN ÉSZLELVE!** 🔥
+            const tokenInfo = await getTokenInfo(mint);
 
-💰 **Token:** ${burn.mint || "Ismeretlen"}
-🔥 **Égetett mennyiség:** ${Number(preBalance).toLocaleString()}
-🏦 **Pool program:** ${accounts.find(a => LP_PROGRAMS.includes(a)) || "Ismeretlen"}
-📌 **Burn cím:** \`${burn.toUserAccount}\`
-⏰ **Időpont:** ${new Date().toLocaleString("hu-HU")}
-🔗 [Solscan link](https://solscan.io/tx/${sig})
-
-#LPBurn #Solana #DeFi`;
-
-                    await bot.sendMessage(ALERT_CHAT_ID, message, { parse_mode: "Markdown" });
-                }
-            }
+            // Telegram értesítés
+            await sendTelegramAlert({
+                txSig,
+                tokenName: tokenInfo.name,
+                tokenSymbol: tokenInfo.symbol,
+                mint,
+                timestamp: new Date(event.blockTime * 1000),
+            });
         }
 
-        return res.status(200).send("OK");
+        res.status(200).send("OK");
     } catch (error) {
-        console.error("❌ Webhook error:", error.message);
-        return res.status(500).send("Webhook Error");
+        console.error("❌ Webhook feldolgozási hiba:", error.message);
+        res.status(500).send("Internal server error");
     }
 });
 
-// Start server
+// --- Token infó lekérdezés (DexScreener + Jupiter fallback) ---
+async function getTokenInfo(mint) {
+    let info = { name: "Ismeretlen token", symbol: "UNKNOWN" };
+
+    try {
+        const dex = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+        if (dex.data?.pairs?.[0]?.baseToken) {
+            info = {
+                name: dex.data.pairs[0].baseToken.name,
+                symbol: dex.data.pairs[0].baseToken.symbol,
+            };
+            return info;
+        }
+    } catch (e) {
+        console.warn(`⚠️ DexScreener nem adott adatot: ${mint}`);
+    }
+
+    try {
+        const jup = await axios.get("https://token.jup.ag/strict");
+        const token = jup.data.find((t) => t.address === mint);
+        if (token) {
+            info = { name: token.name, symbol: token.symbol };
+            return info;
+        }
+    } catch (e) {
+        console.warn(`⚠️ Jupiter nem adott adatot: ${mint}`);
+    }
+
+    return info;
+}
+
+// --- Telegram értesítés ---
+async function sendTelegramAlert(burnInfo) {
+    const message = `
+🔥 **LP BURN ÉSZLELVE** 🔥
+
+💰 **Token:** ${burnInfo.tokenName} (${burnInfo.tokenSymbol})
+🏷️ **Mint:** \`${burnInfo.mint}\`
+📊 **Tranzakció:** [Solscan](https://solscan.io/tx/${burnInfo.txSig})
+⏰ **Időpont:** ${burnInfo.timestamp.toLocaleString("hu-HU")}
+
+#LPBurned #${burnInfo.tokenSymbol}
+    `;
+
+    await bot.sendMessage(ALERT_CHAT_ID, message.trim(), {
+        parse_mode: "Markdown",
+        disable_web_page_preview: false,
+    });
+
+    console.log(`✅ Telegram értesítés küldve: ${burnInfo.tokenSymbol}`);
+}
+
+// --- Indítás ---
 app.listen(PORT, () => {
-    console.log(`🌐 Server running on port ${PORT}`);
-    console.log(`🔔 Webhook URL: https://YOUR-RENDER-URL/webhook`);
+    console.log(`🚀 LP Burn Monitor fut a ${PORT} porton`);
 });
