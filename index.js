@@ -127,41 +127,21 @@ async function sendLPBurnAlert(burnInfo) {
     }
 }
 
-// WebSocket monitoring
-function startWebSocketMonitoring() {
-    const ws = new WebSocket('wss://api.mainnet-beta.solana.com');
+// Polling method (more reliable than WebSocket for this use case)
+function startPollingMonitoring() {
+    console.log('🔄 Starting polling mode for better reliability...');
     
-    ws.on('open', () => {
-        console.log('🔌 WebSocket connected');
-        
-        ws.send(JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'logsSubscribe',
-            params: [
-                { mentions: [RAYDIUM_PROGRAM] },
-                { commitment: 'confirmed' }
-            ]
-        }));
-        
-        console.log('📡 Subscribed to Raydium events');
-    });
-
-    ws.on('message', async (data) => {
+    setInterval(async () => {
         try {
-            const message = JSON.parse(data);
-            
-            if (message.method === 'logsNotification') {
-                const signature = message.params?.result?.signature;
+            const signatures = await connection.getSignaturesForAddress(
+                new PublicKey(RAYDIUM_PROGRAM),
+                { limit: 20 }
+            );
+
+            for (const sigInfo of signatures) {
+                if (processedTxs.has(sigInfo.signature)) continue;
                 
-                // Skip if signature is null/undefined
-                if (!signature || typeof signature !== 'string') {
-                    console.log('⚠️ Skipping invalid signature:', signature);
-                    return;
-                }
-                
-                if (processedTxs.has(signature)) return;
-                processedTxs.add(signature);
+                processedTxs.add(sigInfo.signature);
                 
                 // Memory cleanup
                 if (processedTxs.size > 5000) {
@@ -169,11 +149,78 @@ function startWebSocketMonitoring() {
                     oldest.forEach(sig => processedTxs.delete(sig));
                 }
                 
-                const burnInfo = await checkLPBurn(signature);
+                const burnInfo = await checkLPBurn(sigInfo.signature);
                 if (burnInfo) {
                     console.log(`🔥 LP burn detected: ${burnInfo.tokenSymbol}`);
                     await sendLPBurnAlert(burnInfo);
                 }
+                
+                // Rate limiting to avoid overwhelming the RPC
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+        } catch (error) {
+            console.error('Polling error:', error.message);
+        }
+    }, 15000); // Check every 15 seconds
+}
+
+// WebSocket monitoring (backup method)
+function startWebSocketMonitoring() {
+    console.log('🔌 Starting WebSocket monitoring as backup...');
+    
+    const ws = new WebSocket('wss://api.mainnet-beta.solana.com');
+    
+    ws.on('open', () => {
+        console.log('🔌 WebSocket connected');
+        
+        // Subscribe to account changes for Raydium program
+        ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'programSubscribe',
+            params: [
+                RAYDIUM_PROGRAM,
+                {
+                    commitment: 'confirmed',
+                    encoding: 'base64'
+                }
+            ]
+        }));
+        
+        console.log('📡 Subscribed to Raydium program changes');
+    });
+
+    ws.on('message', async (data) => {
+        try {
+            const message = JSON.parse(data);
+            
+            if (message.method === 'programNotification') {
+                // For program notifications, we need to poll recent transactions
+                console.log('📊 Program change detected, checking recent transactions...');
+                
+                // Get recent signatures and check them
+                setTimeout(async () => {
+                    try {
+                        const signatures = await connection.getSignaturesForAddress(
+                            new PublicKey(RAYDIUM_PROGRAM),
+                            { limit: 5 }
+                        );
+
+                        for (const sigInfo of signatures) {
+                            if (processedTxs.has(sigInfo.signature)) continue;
+                            
+                            processedTxs.add(sigInfo.signature);
+                            const burnInfo = await checkLPBurn(sigInfo.signature);
+                            
+                            if (burnInfo) {
+                                console.log(`🔥 LP burn detected via WebSocket: ${burnInfo.tokenSymbol}`);
+                                await sendLPBurnAlert(burnInfo);
+                            }
+                        }
+                    } catch (error) {
+                        console.error('WebSocket transaction check error:', error.message);
+                    }
+                }, 1000);
             }
         } catch (error) {
             console.error('WebSocket message error:', error.message);
@@ -185,8 +232,13 @@ function startWebSocketMonitoring() {
     });
 
     ws.on('close', () => {
-        console.log('🔌 WebSocket closed, reconnecting...');
-        setTimeout(startWebSocketMonitoring, 5000);
+        console.log('🔌 WebSocket closed, will restart with next poll cycle');
+        // Don't immediately reconnect, let polling handle it
+        setTimeout(() => {
+            if (ws.readyState === WebSocket.CLOSED) {
+                startWebSocketMonitoring();
+            }
+        }, 30000);
     });
 }
 
@@ -206,13 +258,16 @@ async function startBot() {
         await bot.sendMessage(TELEGRAM_CHAT_ID, 
             '🚀 LP Burn Monitor elindult!\n\n' +
             '🔥 Figyelek minden LP égetést a Solana hálózaton\n' +
-            '✅ Értesíteni foglak, ha egy memecoin elégeti az LP-t!\n\n' +
+            '✅ Értesíteni foglak, ha egy memecoin elégeti az LP-t!\n' +
+            '⚡ Polling módban működök (15s ciklusok)\n\n' +
             '#LPBurnMonitor #Online'
         );
         
+        // Start both monitoring methods
+        startPollingMonitoring();
         startWebSocketMonitoring();
         
-        console.log('🚀 LP Burn Monitor started successfully!');
+        console.log('🚀 LP Burn Monitor started successfully with dual monitoring!');
         
     } catch (error) {
         console.error('❌ Failed to start bot:', error);
