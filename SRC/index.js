@@ -1,59 +1,55 @@
 import express from "express";
-import dotenv from "dotenv";
+import bodyParser from "body-parser";
+import fetch from "node-fetch";
 import TelegramBot from "node-telegram-bot-api";
+import dotenv from "dotenv";
 
 dotenv.config();
 
 const app = express();
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
+app.use(bodyParser.json());
 
-app.use(express.json());
-
+const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID;
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
-// Webhook endpoint - Helius innen küldi a burn eventeket
+// Webhook végpont
 app.post("/webhook", async (req, res) => {
   try {
-    const events = req.body;
+    const data = req.body;
 
-    console.log("🔥 ÚJ WEBHOOK ÉRKEZETT:", JSON.stringify(events, null, 2));
+    if (data?.events) {
+      for (const event of data.events) {
+        if (event.type === "BURN") {
+          const signature = event.signature;
+          const amount = event.amount || "Ismeretlen";
+          const token = event.token || "Ismeretlen token";
 
-    if (!events || !Array.isArray(events)) {
-      return res.status(400).send("Nincs érvényes esemény");
-    }
-
-    for (const event of events) {
-      // Csak LP-burn események érdekelnek
-      if (
-        event.type === "BURN" ||
-        (event.description && event.description.toLowerCase().includes("burn"))
-      ) {
-        const signature = event.signature || "Ismeretlen";
-        const token = event.tokenSymbol || "Ismeretlen token";
-        const amount = event.amount || "Ismeretlen összeg";
-
-        const msg = `
-🔥 *LP BURN ÉSZLELVE* 🔥
-
-💎 Token: *${token}*
-📉 Összeg: *${amount}*
-🔗 [Solscan](https://solscan.io/tx/${signature})
-        `;
-
-        await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: "Markdown" });
-        console.log("✅ Telegramra küldve:", token, amount);
+          await bot.sendMessage(
+            CHANNEL_ID,
+            `🔥 LP BURN ÉSZLELVE 🔥\n\n` +
+              `Token: ${token}\n` +
+              `Összeg: ${amount}\n` +
+              `Tx: https://solscan.io/tx/${signature}`
+          );
+        }
       }
     }
 
     res.status(200).send("OK");
-  } catch (error) {
-    console.error("❌ Hiba a webhook feldolgozásában:", error);
+  } catch (err) {
+    console.error("Webhook feldolgozási hiba:", err);
     res.status(500).send("Hiba");
   }
 });
 
-// Render web service port
+// Health check
+app.get("/", (req, res) => {
+  res.send("🚀 Solana LP-burn bot fut!");
+});
+
+// Render által adott port
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`🚀 Webhook szerver fut a ${PORT}-es porton`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Szerver fut a ${PORT} porton`);
 });
