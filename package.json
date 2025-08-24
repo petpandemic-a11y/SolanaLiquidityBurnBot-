@@ -1,19 +1,32 @@
 {
-  "name": "lp-burn-monitor",
-  "version": "1.0.0",
-  "main": "index.js",
+  "name": "solana-lp-burn-monitor",
+  "version": "3.2.0",
+  "description": "Telegram bot Solana LP burn eseményekhez (Raydium, Jupiter, Orca, Helius API)",
+  "main": "SRC/index.js",
   "type": "module",
-  "engines": {
-    "node": "18.x"
-  },
   "scripts": {
-    "start": "node index.js"
+    "start": "node SRC/index.js"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.87.6",
-    "node-telegram-bot-api": "^0.64.0",
-    "axios": "^1.6.2",
-    "ws": "^8.14.2",
-    "express": "^4.18.2"
-  }
+    "@solana/web3.js": "^1.95.3",
+    "axios": "^1.7.4",
+    "dotenv": "^16.3.1",
+    "express": "^4.19.2",
+    "node-telegram-bot-api": "^0.61.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "solana",
+    "lp-burn",
+    "telegram",
+    "helius",
+    "raydium",
+    "orca",
+    "jupiter",
+    "web3"
+  ],
+  "author": "Zso Zsu Dan",
+  "license": "MIT"
 }
