@@ -2,10 +2,10 @@
   "name": "solana-lp-burn-monitor",
   "version": "1.0.0",
   "description": "Telegram bot that monitors Solana network for memecoin liquidity pool burns",
-  "main": "src/index.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "nodemon src/index.js",
+    "start": "node index.js",
+    "dev": "nodemon index.js",
     "test": "jest",
     "test:unit": "jest --testPathPattern=tests/unit",
     "test:integration": "jest --testPathPattern=tests/integration",
