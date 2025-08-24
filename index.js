@@ -582,4 +582,6 @@ app.listen(PORT, () => {
 // Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('🛑 Graceful shutdown...');
-    st
+    stopMonitoring();
+    process.exit(0);
+});
