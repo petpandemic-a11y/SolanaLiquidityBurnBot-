@@ -34,6 +34,8 @@ app.use(express.json());
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
+    mode: 'polling',
+    interval: '10 seconds',
     settings,
     processed: processedTxs.size,
     timestamp: new Date().toISOString()
@@ -64,9 +66,10 @@ bot.onText(/\/start/, async (msg) => {
 
 **Jelenlegi beállítások:**
 💎 Min SOL: ${settings.minSOL} SOL
-📊 Min MC: $${settings.minMarketCap.toLocaleString()}
-📈 Max MC: $${settings.maxMarketCap.toLocaleString()}
+📊 Min MC: ${settings.minMarketCap.toLocaleString()}
+📈 Max MC: ${settings.maxMarketCap.toLocaleString()}
 ⚡ Aktív: ${settings.isActive ? '✅' : '❌'}
+⏰ **Ellenőrzés: 10 másodpercenként**
     `;
     
     bot.sendMessage(chatId, welcomeMsg, { parse_mode: 'Markdown' });
@@ -82,10 +85,10 @@ bot.onText(/\/settings/, async (msg) => {
 
 💎 **Min SOL égetve:** ${settings.minSOL} SOL
 🔢 **Min tokens égetve:** ${settings.minTokens.toLocaleString()}
-📊 **Min MarketCap:** $${settings.minMarketCap.toLocaleString()}
-📈 **Max MarketCap:** $${settings.maxMarketCap.toLocaleString()}
+📊 **Min MarketCap:** ${settings.minMarketCap.toLocaleString()}
+📈 **Max MarketCap:** ${settings.maxMarketCap.toLocaleString()}
 ⚡ **Monitor állapot:** ${settings.isActive ? '🟢 Aktív' : '🔴 Inaktív'}
-⏰ **Ellenőrzés:** 10 percenként
+⏰ **Ellenőrzés:** 10 másodpercenként
 📊 **Feldolgozott tx:** ${processedTxs.size}
 
 **Parancsok a módosításhoz:**
@@ -163,9 +166,9 @@ bot.onText(/\/start_monitor/, async (msg) => {
 
 📊 **Beállítások:**
 💎 Min SOL: ${settings.minSOL} SOL
-📈 Min MC: $${settings.minMarketCap.toLocaleString()}
-📉 Max MC: $${settings.maxMarketCap.toLocaleString()}
-⏰ **Ellenőrzés:** 10 percenként
+📈 Min MC: ${settings.minMarketCap.toLocaleString()}
+📉 Max MC: ${settings.maxMarketCap.toLocaleString()}
+⏰ **Ellenőrzés:** 10 másodpercenként
 
 🔍 Keresem a meme/SOL LP burnokat...
     `, { parse_mode: 'Markdown' });
@@ -203,7 +206,7 @@ bot.onText(/\/status/, async (msg) => {
 **Utolsó 5 feldolgozott:**
 ${Array.from(processedTxs).slice(-5).map(tx => `• ${tx.slice(0, 8)}...`).join('\n') || 'Nincs adat'}
 
-**Következő ellenőrzés:** ${settings.isActive ? 'Max 10 perc' : 'Monitor leállítva'}
+**Következő ellenőrzés:** ${settings.isActive ? 'Max 10 másodperc' : 'Monitor leállítva'}
     `;
     
     bot.sendMessage(chatId, statusMsg, { parse_mode: 'Markdown' });
@@ -235,10 +238,12 @@ bot.onText(/\/help/, async (msg) => {
 /setmaxmc 5000000 → Csak $5M alatti MC tokeneket
 
 **Működés:**
-• 10 percenként ellenőriz Helius API-n keresztül
+• **10 másodpercenként** ellenőriz Helius API-n keresztül
+• Csak elmúlt **10 másodperc** tranzakcióit nézi
 • Csak meme/SOL LP burnokat keres
 • MarketCap adatok DexScreener-ről
 • Instant Telegram értesítés
+• Helius kredit takarékos használat
     `;
     
     bot.sendMessage(chatId, helpMsg, { parse_mode: 'Markdown' });
@@ -250,11 +255,11 @@ function startMonitoring() {
         clearInterval(monitorInterval);
     }
     
-    console.log('🚀 Starting LP burn monitoring every 10 minutes...');
+    console.log('🚀 Starting LP burn monitoring every 10 SECONDS...');
     
-    // Run immediately, then every 10 minutes
+    // Run immediately, then every 10 seconds
     checkForLPBurns();
-    monitorInterval = setInterval(checkForLPBurns, 10 * 60 * 1000); // 10 minutes
+    monitorInterval = setInterval(checkForLPBurns, 10 * 1000); // 10 seconds
 }
 
 function stopMonitoring() {
@@ -265,30 +270,30 @@ function stopMonitoring() {
     console.log('🛑 LP burn monitoring stopped');
 }
 
-// Check for LP burns in last 10 minutes
+// Check for LP burns in last 10 SECONDS
 async function checkForLPBurns() {
     if (!settings.isActive) return;
     
     try {
-        console.log('🔍 Checking for LP burns in last 10 minutes...');
+        console.log('🔍 Checking for LP burns in last 10 seconds...');
         
-        // Get signatures from last 10 minutes
+        // Get recent signatures
         const signatures = await connection.getSignaturesForAddress(
             new PublicKey(RAYDIUM_PROGRAM),
-            { limit: 50 }
+            { limit: 20 } // Smaller limit for frequent checks
         );
         
         const now = Date.now();
-        const tenMinutesAgo = now - (10 * 60 * 1000);
+        const tenSecondsAgo = now - (10 * 1000); // 10 seconds ago
         
         let checkedCount = 0;
         let newTransactions = 0;
         
         for (const sigInfo of signatures) {
-            // Check if transaction is from last 10 minutes
+            // Check if transaction is from last 10 seconds
             const txTime = sigInfo.blockTime * 1000;
-            if (txTime < tenMinutesAgo) {
-                console.log(`⏰ Transaction too old: ${new Date(txTime).toLocaleTimeString()}`);
+            if (txTime < tenSecondsAgo) {
+                console.log(`⏰ Transaction older than 10s: ${Math.round((now - txTime) / 1000)}s ago`);
                 break;
             }
             
@@ -300,8 +305,8 @@ async function checkForLPBurns() {
             newTransactions++;
             
             // Memory cleanup
-            if (processedTxs.size > 2000) {
-                const oldest = Array.from(processedTxs).slice(0, 1000);
+            if (processedTxs.size > 1000) { // Smaller cache for frequent updates
+                const oldest = Array.from(processedTxs).slice(0, 500);
                 oldest.forEach(sig => processedTxs.delete(sig));
             }
             
@@ -313,22 +318,27 @@ async function checkForLPBurns() {
                 await sendLPBurnAlert(burnInfo);
             }
             
-            // Rate limiting - wait between checks
-            await new Promise(resolve => setTimeout(resolve, 200));
+            // Shorter rate limiting for 10s cycles
+            await new Promise(resolve => setTimeout(resolve, 50)); // 50ms delay
         }
         
-        console.log(`✅ Scan complete: ${checkedCount} new transactions checked, ${newTransactions} total new`);
+        if (newTransactions > 0) {
+            console.log(`✅ Checked ${checkedCount} new transactions in last 10 seconds`);
+        }
         
     } catch (error) {
         console.error('❌ Error checking LP burns:', error.message);
         
-        // Notify admin of errors
-        try {
-            await bot.sendMessage(settings.adminChatId, 
-                `❌ **Monitor hiba:**\n\n${error.message}\n\n⏰ ${new Date().toLocaleTimeString()}`
-            );
-        } catch (notifyError) {
-            console.error('Failed to notify admin of error:', notifyError.message);
+        // Only notify admin of repeated errors to avoid spam
+        if (!checkForLPBurns.lastError || Date.now() - checkForLPBurns.lastError > 60000) {
+            try {
+                await bot.sendMessage(settings.adminChatId, 
+                    `❌ **Monitor hiba:**\n\n${error.message}\n\n⏰ ${new Date().toLocaleTimeString()}`
+                );
+                checkForLPBurns.lastError = Date.now();
+            } catch (notifyError) {
+                console.error('Failed to notify admin of error:', notifyError.message);
+            }
         }
     }
 }
@@ -547,9 +557,12 @@ app.get('/', (req, res) => {
     res.json({
         name: 'Telegram LP Burn Monitor',
         version: '3.0.0',
+        mode: 'polling',
+        interval: '10 seconds',
         status: settings.isActive ? 'monitoring' : 'idle',
         settings: settings,
-        processed: processedTxs.size
+        processed: processedTxs.size,
+        instructions: 'Use Telegram bot commands to control monitoring'
     });
 });
 
