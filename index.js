@@ -130,46 +130,50 @@ async function sendLPBurnAlert(burnInfo) {
     }
 }
 
-// Polling method (more reliable than WebSocket for this use case)
+// Polling method with aggressive rate limiting
 function startPollingMonitoring() {
-    console.log('🔄 Starting polling mode with rate limiting...');
+    console.log('🔄 Starting ultra-conservative polling to avoid rate limits...');
     
     setInterval(async () => {
         try {
+            // Get fewer signatures
             const signatures = await connection.getSignaturesForAddress(
                 new PublicKey(RAYDIUM_PROGRAM),
-                { limit: 10 } // Reduced from 20 to 10
+                { limit: 5 } // Reduced from 10 to 5
             );
 
-            for (const sigInfo of signatures.slice(0, 5)) { // Only check first 5
+            // Only check the most recent 2 transactions
+            for (const sigInfo of signatures.slice(0, 2)) {
                 if (processedTxs.has(sigInfo.signature)) continue;
                 
                 processedTxs.add(sigInfo.signature);
                 
                 // Memory cleanup
-                if (processedTxs.size > 3000) { // Reduced size
-                    const oldest = Array.from(processedTxs).slice(0, 1500);
+                if (processedTxs.size > 1000) { // Reduced from 3000
+                    const oldest = Array.from(processedTxs).slice(0, 500);
                     oldest.forEach(sig => processedTxs.delete(sig));
                 }
                 
+                console.log(`🔍 Checking signature: ${sigInfo.signature.slice(0, 8)}...`);
+                
                 const burnInfo = await checkLPBurn(sigInfo.signature);
                 if (burnInfo) {
-                    console.log(`🔥 LP burn detected: ${burnInfo.tokenSymbol}`);
+                    console.log(`🔥 100% LP burn detected: ${burnInfo.tokenSymbol}`);
                     await sendLPBurnAlert(burnInfo);
                 }
                 
-                // Longer rate limiting to avoid 429 errors
-                await new Promise(resolve => setTimeout(resolve, 500)); // Increased from 100ms
+                // Much longer delay between requests
+                await new Promise(resolve => setTimeout(resolve, 2000)); // 2 seconds between each check
             }
         } catch (error) {
-            if (error.message.includes('429')) {
-                console.log('⚠️ Rate limited, waiting longer...');
-                await new Promise(resolve => setTimeout(resolve, 5000));
+            if (error.message.includes('429') || error.message.includes('Too Many Requests')) {
+                console.log('⚠️ Rate limited! Waiting 10 seconds...');
+                await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 seconds
             } else {
                 console.error('Polling error:', error.message);
             }
         }
-    }, 30000); // Increased from 15s to 30s
+    }, 60000); // Check every 60 seconds instead of 30
 }
 
 // WebSocket monitoring (backup method) - DISABLED to reduce load
@@ -269,8 +273,9 @@ async function startBot() {
             '🚀 LP Burn Monitor elindult!\n\n' +
             '🔥 **CSAK 100% LP ÉGETÉSEKET** figyelek!\n' +
             '✅ Csak akkor írok, ha teljes LP elégetve\n' +
-            '⚡ Polling mód: 30s ciklusok (rate limit safe)\n' +
-            '🛡️ Rug pull védelem detector!\n\n' +
+            '⚡ Ultra-konzervatív mód: 60s ciklusok\n' +
+            '🛡️ Rate limit safe működés\n' +
+            '🎯 Csak a legfrissebb 2 tranzakciót ellenőrzöm\n\n' +
             '#100PercentBurn #LPBurnMonitor #Online'
         );
         
