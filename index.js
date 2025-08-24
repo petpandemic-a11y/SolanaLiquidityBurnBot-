@@ -8,20 +8,20 @@ const PORT = process.env.PORT || 3000;
 
 // Environment variables
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || process.env.TELEGRAM_CHAT_ID; // Private chat for commands
-const ALERT_CHAT_ID = process.env.ALERT_CHAT_ID || process.env.TELEGRAM_CHAT_ID; // Channel for alerts
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || process.env.TELEGRAM_CHAT_ID;
+const ALERT_CHAT_ID = process.env.ALERT_CHAT_ID || process.env.TELEGRAM_CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const RAYDIUM_PROGRAM = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
 
-// Bot settings (stored in memory, configurable via Telegram)
+// Bot settings
 let settings = {
-    minSOL: 5,                    // Minimum SOL burned
-    minTokens: 1000000,           // Minimum tokens burned
-    minMarketCap: 10000,          // Minimum $10K marketcap
-    maxMarketCap: 50000000,       // Maximum $50M marketcap
-    isActive: false,              // Monitor active/inactive
-    adminChatId: ADMIN_CHAT_ID,   // Private chat for commands
-    alertChatId: ALERT_CHAT_ID    // Channel for alerts
+    minSOL: 5,
+    minTokens: 1000000,
+    minMarketCap: 10000,
+    maxMarketCap: 50000000,
+    isActive: false,
+    adminChatId: ADMIN_CHAT_ID,
+    alertChatId: ALERT_CHAT_ID
 };
 
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
@@ -34,65 +34,86 @@ app.use(express.json());
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    mode: 'polling',
-    interval: '10 seconds',
-    chats: {
-      admin: settings.adminChatId,
-      alerts: settings.alertChatId
-    },
-    settings,
-    processed: processedTxs.size,
-    timestamp: new Date().toISOString()
-  });
+    res.json({
+        status: 'ok',
+        mode: 'polling',
+        interval: '10 seconds',
+        chats: {
+            admin: settings.adminChatId,
+            alerts: settings.alertChatId
+        },
+        settings,
+        processed: processedTxs.size,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Root endpoint
+app.get('/', (req, res) => {
+    res.json({
+        name: 'Telegram LP Burn Monitor',
+        version: '3.1.0',
+        mode: 'polling',
+        interval: '10 seconds',
+        status: settings.isActive ? 'monitoring' : 'idle',
+        chats: {
+            admin: settings.adminChatId + ' (commands)',
+            alerts: settings.alertChatId + ' (notifications)'
+        },
+        settings: settings,
+        processed: processedTxs.size,
+        instructions: 'Send /start to admin chat to control monitoring'
+    });
 });
 
 // Telegram Bot Commands
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
     
-    if (chatId.toString() !== settings.adminChatId) {
-        bot.sendMessage(chatId, '⛔ Unauthorized access');
+    console.log(`🔍 Start command from chatId: ${chatId}, adminChatId: ${settings.adminChatId}`);
+    
+    if (chatId.toString() !== settings.adminChatId.toString()) {
+        console.log(`⛔ Unauthorized access attempt from ${chatId}`);
+        bot.sendMessage(chatId, `⛔ Unauthorized access\n\nYour chat ID: ${chatId}\nAdmin chat ID: ${settings.adminChatId}\n\n💡 Set ADMIN_CHAT_ID environment variable to your private chat ID`);
         return;
     }
     
-    const welcomeMsg = `
-🚀 **LP Burn Monitor Bot**
+    const welcomeMsg = `🚀 **LP Burn Monitor Bot**
 
 **Parancsok:**
 /settings - Jelenlegi beállítások
 /setsol <érték> - Min SOL beállítás (pl: /setsol 10)
-/setminmc <érték> - Min MarketCap (pl: /setminmc 50000)  
+/setminmc <érték> - Min MarketCap (pl: /setminmc 50000)
 /setmaxmc <érték> - Max MarketCap (pl: /setmaxmc 10000000)
 /start_monitor - Monitoring indítás
 /stop_monitor - Monitoring megállítás
 /status - Bot állapot
 /help - Súgó
 
+**Beállított chat-ek:**
+👤 **Admin (parancsok):** ${settings.adminChatId}
+📢 **Alert (értesítések):** ${settings.alertChatId}
+
 **Jelenlegi beállítások:**
 💎 Min SOL: ${settings.minSOL} SOL
-📊 Min MC: ${settings.minMarketCap.toLocaleString()}
-📈 Max MC: ${settings.maxMarketCap.toLocaleString()}
+📊 Min MC: $${settings.minMarketCap.toLocaleString()}
+📈 Max MC: $${settings.maxMarketCap.toLocaleString()}
 ⚡ Aktív: ${settings.isActive ? '✅' : '❌'}
-⏰ **Ellenőrzés: 10 másodpercenként**
-    `;
+⏰ **Ellenőrzés: 10 másodpercenként**`;
     
     bot.sendMessage(chatId, welcomeMsg, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/settings/, async (msg) => {
     const chatId = msg.chat.id;
+    if (chatId.toString() !== settings.adminChatId.toString()) return;
     
-    if (chatId.toString() !== settings.adminChatId) return;
-    
-    const settingsMsg = `
-⚙️ **Jelenlegi beállítások:**
+    const settingsMsg = `⚙️ **Jelenlegi beállítások:**
 
 💎 **Min SOL égetve:** ${settings.minSOL} SOL
 🔢 **Min tokens égetve:** ${settings.minTokens.toLocaleString()}
-📊 **Min MarketCap:** ${settings.minMarketCap.toLocaleString()}
-📈 **Max MarketCap:** ${settings.maxMarketCap.toLocaleString()}
+📊 **Min MarketCap:** $${settings.minMarketCap.toLocaleString()}
+📈 **Max MarketCap:** $${settings.maxMarketCap.toLocaleString()}
 ⚡ **Monitor állapot:** ${settings.isActive ? '🟢 Aktív' : '🔴 Inaktív'}
 ⏰ **Ellenőrzés:** 10 másodpercenként
 📊 **Feldolgozott tx:** ${processedTxs.size}
@@ -100,16 +121,14 @@ bot.onText(/\/settings/, async (msg) => {
 **Parancsok a módosításhoz:**
 /setsol 10 - Min SOL beállítás
 /setminmc 25000 - Min MarketCap
-/setmaxmc 5000000 - Max MarketCap
-    `;
+/setmaxmc 5000000 - Max MarketCap`;
     
     bot.sendMessage(chatId, settingsMsg, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/setsol (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
-    
-    if (chatId.toString() !== settings.adminChatId) return;
+    if (chatId.toString() !== settings.adminChatId.toString()) return;
     
     const newValue = parseFloat(match[1]);
     
@@ -124,8 +143,7 @@ bot.onText(/\/setsol (.+)/, async (msg, match) => {
 
 bot.onText(/\/setminmc (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
-    
-    if (chatId.toString() !== settings.adminChatId) return;
+    if (chatId.toString() !== settings.adminChatId.toString()) return;
     
     const newValue = parseFloat(match[1]);
     
@@ -140,8 +158,7 @@ bot.onText(/\/setminmc (.+)/, async (msg, match) => {
 
 bot.onText(/\/setmaxmc (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
-    
-    if (chatId.toString() !== settings.adminChatId) return;
+    if (chatId.toString() !== settings.adminChatId.toString()) return;
     
     const newValue = parseFloat(match[1]);
     
@@ -156,8 +173,7 @@ bot.onText(/\/setmaxmc (.+)/, async (msg, match) => {
 
 bot.onText(/\/start_monitor/, async (msg) => {
     const chatId = msg.chat.id;
-    
-    if (chatId.toString() !== settings.adminChatId) return;
+    if (chatId.toString() !== settings.adminChatId.toString()) return;
     
     if (settings.isActive) {
         bot.sendMessage(chatId, '⚠️ Monitor már aktív!');
@@ -167,23 +183,20 @@ bot.onText(/\/start_monitor/, async (msg) => {
     settings.isActive = true;
     startMonitoring();
     
-    bot.sendMessage(chatId, `
-✅ **Monitor elindítva!**
+    bot.sendMessage(chatId, `✅ **Monitor elindítva!**
 
 📊 **Beállítások:**
 💎 Min SOL: ${settings.minSOL} SOL
-📈 Min MC: ${settings.minMarketCap.toLocaleString()}
-📉 Max MC: ${settings.maxMarketCap.toLocaleString()}
+📈 Min MC: $${settings.minMarketCap.toLocaleString()}
+📉 Max MC: $${settings.maxMarketCap.toLocaleString()}
 ⏰ **Ellenőrzés:** 10 másodpercenként
 
-🔍 Keresem a meme/SOL LP burnokat...
-    `, { parse_mode: 'Markdown' });
+🔍 Keresem a meme/SOL LP burnokat...`, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/stop_monitor/, async (msg) => {
     const chatId = msg.chat.id;
-    
-    if (chatId.toString() !== settings.adminChatId) return;
+    if (chatId.toString() !== settings.adminChatId.toString()) return;
     
     if (!settings.isActive) {
         bot.sendMessage(chatId, '⚠️ Monitor már inaktív!');
@@ -192,17 +205,14 @@ bot.onText(/\/stop_monitor/, async (msg) => {
     
     settings.isActive = false;
     stopMonitoring();
-    
     bot.sendMessage(chatId, '🛑 **Monitor megállítva**');
 });
 
 bot.onText(/\/status/, async (msg) => {
     const chatId = msg.chat.id;
+    if (chatId.toString() !== settings.adminChatId.toString()) return;
     
-    if (chatId.toString() !== settings.adminChatId) return;
-    
-    const statusMsg = `
-📊 **Bot állapot:**
+    const statusMsg = `📊 **Bot állapot:**
 
 ⚡ **Monitor:** ${settings.isActive ? '🟢 Aktív' : '🔴 Inaktív'}
 🔢 **Feldolgozott tx:** ${processedTxs.size}
@@ -212,19 +222,16 @@ bot.onText(/\/status/, async (msg) => {
 **Utolsó 5 feldolgozott:**
 ${Array.from(processedTxs).slice(-5).map(tx => `• ${tx.slice(0, 8)}...`).join('\n') || 'Nincs adat'}
 
-**Következő ellenőrzés:** ${settings.isActive ? 'Max 10 másodperc' : 'Monitor leállítva'}
-    `;
+**Következő ellenőrzés:** ${settings.isActive ? 'Max 10 másodperc' : 'Monitor leállítva'}`;
     
     bot.sendMessage(chatId, statusMsg, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/help/, async (msg) => {
     const chatId = msg.chat.id;
+    if (chatId.toString() !== settings.adminChatId.toString()) return;
     
-    if (chatId.toString() !== settings.adminChatId) return;
-    
-    const helpMsg = `
-📖 **LP Burn Monitor Súgó**
+    const helpMsg = `📖 **LP Burn Monitor Súgó**
 
 **Fő parancsok:**
 /start - Indítás és alapparancsok
@@ -249,8 +256,7 @@ bot.onText(/\/help/, async (msg) => {
 • Csak meme/SOL LP burnokat keres
 • MarketCap adatok DexScreener-ről
 • Instant Telegram értesítés
-• Helius kredit takarékos használat
-    `;
+• Helius kredit takarékos használat`;
     
     bot.sendMessage(chatId, helpMsg, { parse_mode: 'Markdown' });
 });
@@ -262,10 +268,8 @@ function startMonitoring() {
     }
     
     console.log('🚀 Starting LP burn monitoring every 10 SECONDS...');
-    
-    // Run immediately, then every 10 seconds
     checkForLPBurns();
-    monitorInterval = setInterval(checkForLPBurns, 10 * 1000); // 10 seconds
+    monitorInterval = setInterval(checkForLPBurns, 10 * 1000);
 }
 
 function stopMonitoring() {
@@ -276,27 +280,25 @@ function stopMonitoring() {
     console.log('🛑 LP burn monitoring stopped');
 }
 
-// Check for LP burns in last 10 SECONDS
+// Check for LP burns in last 10 seconds
 async function checkForLPBurns() {
     if (!settings.isActive) return;
     
     try {
         console.log('🔍 Checking for LP burns in last 10 seconds...');
         
-        // Get recent signatures
         const signatures = await connection.getSignaturesForAddress(
             new PublicKey(RAYDIUM_PROGRAM),
-            { limit: 20 } // Smaller limit for frequent checks
+            { limit: 20 }
         );
         
         const now = Date.now();
-        const tenSecondsAgo = now - (10 * 1000); // 10 seconds ago
+        const tenSecondsAgo = now - (10 * 1000);
         
         let checkedCount = 0;
         let newTransactions = 0;
         
         for (const sigInfo of signatures) {
-            // Check if transaction is from last 10 seconds
             const txTime = sigInfo.blockTime * 1000;
             if (txTime < tenSecondsAgo) {
                 console.log(`⏰ Transaction older than 10s: ${Math.round((now - txTime) / 1000)}s ago`);
@@ -310,8 +312,7 @@ async function checkForLPBurns() {
             processedTxs.add(sigInfo.signature);
             newTransactions++;
             
-            // Memory cleanup
-            if (processedTxs.size > 1000) { // Smaller cache for frequent updates
+            if (processedTxs.size > 1000) {
                 const oldest = Array.from(processedTxs).slice(0, 500);
                 oldest.forEach(sig => processedTxs.delete(sig));
             }
@@ -324,8 +325,7 @@ async function checkForLPBurns() {
                 await sendLPBurnAlert(burnInfo);
             }
             
-            // Shorter rate limiting for 10s cycles
-            await new Promise(resolve => setTimeout(resolve, 50)); // 50ms delay
+            await new Promise(resolve => setTimeout(resolve, 50));
         }
         
         if (newTransactions > 0) {
@@ -335,7 +335,6 @@ async function checkForLPBurns() {
     } catch (error) {
         console.error('❌ Error checking LP burns:', error.message);
         
-        // Only notify admin of repeated errors to avoid spam
         if (!checkForLPBurns.lastError || Date.now() - checkForLPBurns.lastError > 60000) {
             try {
                 await bot.sendMessage(settings.adminChatId, 
@@ -362,7 +361,6 @@ async function checkTransactionForBurn(signature) {
         const preBalances = tx.meta.preTokenBalances || [];
         const postBalances = tx.meta.postTokenBalances || [];
         
-        // Look for token burns and SOL in same transaction
         let solBurned = 0;
         let tokenBurnInfo = null;
         
@@ -371,9 +369,9 @@ async function checkTransactionForBurn(signature) {
             for (let i = 0; i < tx.meta.preBalances.length; i++) {
                 const preBalance = tx.meta.preBalances[i];
                 const postBalance = tx.meta.postBalances[i];
-                const diff = (preBalance - postBalance) / 1e9; // Convert to SOL
+                const diff = (preBalance - postBalance) / 1e9;
                 
-                if (diff > 0.01) { // Meaningful SOL amount
+                if (diff > 0.01) {
                     solBurned += diff;
                 }
             }
@@ -385,9 +383,7 @@ async function checkTransactionForBurn(signature) {
             const preAmount = pre.uiTokenAmount?.uiAmount || 0;
             const postAmount = post?.uiTokenAmount?.uiAmount || 0;
 
-            // Large burn to zero
             if (preAmount > settings.minTokens && postAmount === 0) {
-                // Skip known stablecoins
                 const skipTokens = [
                     'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
                     'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
@@ -405,17 +401,14 @@ async function checkTransactionForBurn(signature) {
             }
         }
         
-        // Must have both token burn and SOL burn
         if (!tokenBurnInfo || solBurned < settings.minSOL) {
             return null;
         }
         
         console.log(`🎯 Potential LP burn: ${tokenBurnInfo.burnedAmount.toLocaleString()} tokens + ${solBurned.toFixed(2)} SOL`);
         
-        // Get token info and marketcap
         const tokenInfo = await getTokenInfoAndMarketcap(tokenBurnInfo.mint);
         
-        // Check marketcap filter
         if (tokenInfo.marketcap > 0) {
             if (tokenInfo.marketcap < settings.minMarketCap || tokenInfo.marketcap > settings.maxMarketCap) {
                 console.log(`⚠️ Marketcap (${tokenInfo.marketcap.toLocaleString()}) outside range`);
@@ -445,7 +438,6 @@ async function getTokenInfoAndMarketcap(mintAddress) {
     try {
         let tokenInfo = { name: 'Unknown Token', symbol: 'UNKNOWN', marketcap: 0 };
         
-        // Try DexScreener first for marketcap
         try {
             const dexResponse = await axios.get(
                 `https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`,
@@ -465,7 +457,6 @@ async function getTokenInfoAndMarketcap(mintAddress) {
             console.log('⚠️ DexScreener failed:', error.message);
         }
         
-        // Fallback to Jupiter
         try {
             const jupiterResponse = await axios.get('https://token.jup.ag/strict', { timeout: 3000 });
             const token = jupiterResponse.data.find(t => t.address === mintAddress);
@@ -492,16 +483,15 @@ async function sendLPBurnAlert(burnInfo) {
     let marketCapText = 'N/A';
     if (burnInfo.marketcap && burnInfo.marketcap > 0) {
         if (burnInfo.marketcap >= 1000000) {
-            marketCapText = `${(burnInfo.marketcap / 1000000).toFixed(1)}M`;
+            marketCapText = `$${(burnInfo.marketcap / 1000000).toFixed(1)}M`;
         } else if (burnInfo.marketcap >= 1000) {
-            marketCapText = `${(burnInfo.marketcap / 1000).toFixed(0)}K`;
+            marketCapText = `$${(burnInfo.marketcap / 1000).toFixed(0)}K`;
         } else {
-            marketCapText = `${burnInfo.marketcap.toFixed(0)}`;
+            marketCapText = `$${burnInfo.marketcap.toFixed(0)}`;
         }
     }
     
-    const message = `
-🔥 **100% LP ELÉGETVE!** 🔥
+    const message = `🔥 **100% LP ELÉGETVE!** 🔥
 
 💰 **Token:** ${burnInfo.tokenName} (${burnInfo.tokenSymbol})
 🏷️ **Mint:** \`${burnInfo.mint}\`
@@ -518,11 +508,9 @@ async function sendLPBurnAlert(burnInfo) {
 🚀 **Biztonságos memecoin lehet!**
 ⚠️ **DYOR:** Mindig végezz saját kutatást!
 
-#LPBurned #MemeSol #SafeToken #${burnInfo.tokenSymbol}
-    `.trim();
+#LPBurned #MemeSol #SafeToken #${burnInfo.tokenSymbol}`.trim();
 
     try {
-        // Send alert to channel/group (not to admin private chat)
         await bot.sendMessage(settings.alertChatId, message, {
             parse_mode: 'Markdown',
             disable_web_page_preview: false
@@ -530,39 +518,16 @@ async function sendLPBurnAlert(burnInfo) {
         
         console.log(`✅ ALERT SENT to channel: ${burnInfo.tokenSymbol} - ${burnInfo.solBurned.toFixed(2)} SOL burned`);
         
-        // Also notify admin privately about the alert
         await bot.sendMessage(settings.adminChatId, `✅ **Alert küldve!**\n\n${burnInfo.tokenSymbol} LP burn alert elküldve a channelre.`);
         
     } catch (error) {
         console.error('❌ Telegram alert error:', error.message);
         
-        // Notify admin of the error
         try {
             await bot.sendMessage(settings.adminChatId, `❌ **Alert küldési hiba:**\n\n${error.message}`);
         } catch (notifyError) {
             console.error('Failed to notify admin of alert error:', notifyError.message);
         }
-    }
-} 
-🛡️ **${burnInfo.solBurned.toFixed(2)} SOL** biztosan elégetve
-🚫 **Rug pull:** Már nem lehetséges!
-📊 **Tranzakció:** [Solscan](https://solscan.io/tx/${burnInfo.signature})
-
-🚀 **Biztonságos memecoin lehet!**
-⚠️ **DYOR:** Mindig végezz saját kutatást!
-
-#LPBurned #MemeSol #SafeToken #${burnInfo.tokenSymbol}
-    `.trim();
-
-    try {
-        await bot.sendMessage(settings.adminChatId, message, {
-            parse_mode: 'Markdown',
-            disable_web_page_preview: false
-        });
-        
-        console.log(`✅ ALERT SENT: ${burnInfo.tokenSymbol} - ${burnInfo.solBurned.toFixed(2)} SOL burned`);
-    } catch (error) {
-        console.error('❌ Telegram alert error:', error.message);
     }
 }
 
@@ -593,7 +558,6 @@ async function startBot() {
         const version = await connection.getVersion();
         console.log(`⚡ Helius RPC connected: ${version['solana-core']}`);
         
-        // Send startup message to admin
         await bot.sendMessage(ADMIN_CHAT_ID, 
             '🚀 **LP Burn Monitor elindult!**\n\n' +
             '👤 **Admin chat:** Itt adhatsz parancsokat\n' +
@@ -609,24 +573,6 @@ async function startBot() {
     }
 }
 
-// Root endpoint
-app.get('/', (req, res) => {
-    res.json({
-        name: 'Telegram LP Burn Monitor',
-        version: '3.1.0',
-        mode: 'polling',
-        interval: '10 seconds',
-        status: settings.isActive ? 'monitoring' : 'idle',
-        chats: {
-            admin: settings.adminChatId + ' (commands)',
-            alerts: settings.alertChatId + ' (notifications)'
-        },
-        settings: settings,
-        processed: processedTxs.size,
-        instructions: 'Send /start to admin chat to control monitoring'
-    });
-});
-
 // Start server
 app.listen(PORT, () => {
     console.log(`🌐 Server running on port ${PORT}`);
@@ -636,6 +582,4 @@ app.listen(PORT, () => {
 // Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('🛑 Graceful shutdown...');
-    stopMonitoring();
-    process.exit(0);
-});
+    st
