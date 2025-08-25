@@ -14,7 +14,10 @@ const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(id => id.trim()).
 
 // Solana kapcsolat
 const SOLANA_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
-const connection = new Connection(SOLANA_RPC, 'confirmed');
+const connection = new Connection(SOLANA_RPC, {
+    commitment: 'confirmed',
+    confirmTransactionInitialTimeout: 60000
+});
 
 // Telegram bot inicializálás
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
@@ -55,6 +58,10 @@ const rateLimitedRequest = async (requestFn) => {
 };
 
 // ========================= UTILITY FUNCTIONS =========================
+// Raydium AMM Program IDs
+const RAYDIUM_AMM_V4 = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+const ORCA_WHIRLPOOL = 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc';
+
 function log(level, message, data = {}) {
     const timestamp = new Date().toISOString();
     const logData = {
@@ -180,6 +187,33 @@ async function getRecentTransactions() {
 
 async function checkLPBurnViaExplorer(tokenAddress) {
     try {
+        // Először próbáljuk a Jupiter Stats API-t (ingyenes, nem kell kulcs)
+        try {
+            const jupiterResponse = await axios.get(
+                `https://stats.jup.ag/liquidity/v1/tokens/${tokenAddress}`,
+                {
+                    timeout: 5000,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0'
+                    }
+                }
+            );
+
+            if (jupiterResponse.data) {
+                // Jupiter adatok elemzése
+                const liquidityData = jupiterResponse.data;
+                if (liquidityData.liquidity && liquidityData.liquidity === 0) {
+                    return {
+                        burned: true,
+                        percentage: 100,
+                        source: 'Jupiter'
+                    };
+                }
+            }
+        } catch (jupiterError) {
+            log('debug', 'Jupiter API not available', { tokenAddress });
+        }
+
         // Solscan API használata (ingyenes, nem igényel API kulcsot)
         const response = await axios.get(
             `https://api.solscan.io/token/holders`,
@@ -212,7 +246,8 @@ async function checkLPBurnViaExplorer(tokenAddress) {
                         return {
                             burned: true,
                             percentage: percentage,
-                            burnAddress: holder.owner
+                            burnAddress: holder.owner,
+                            source: 'Solscan'
                         };
                     }
                 }
@@ -297,7 +332,14 @@ async function getNewTokensAlternative() {
 
         for (const sig of signatures.slice(0, 10)) { // Csak az első 10-et nézzük
             try {
-                const tx = await connection.getParsedTransaction(sig.signature, 'confirmed');
+                // FONTOS: maxSupportedTransactionVersion: 0 hozzáadása
+                const tx = await connection.getParsedTransaction(
+                    sig.signature, 
+                    {
+                        commitment: 'confirmed',
+                        maxSupportedTransactionVersion: 0
+                    }
+                );
                 
                 if (!tx || !tx.meta || tx.meta.err) continue;
                 
@@ -417,6 +459,9 @@ ${isAdmin(userId) ? `
 /toggle - Enable/disable bot
 /stats - View statistics
 /test - Send test message
+/debug - Debug information
+/forcecheck - Force manual check
+/clear - Clear cache
 ` : '❌ <b>You do not have admin access</b>'}
 
 <b>Public Commands:</b>
@@ -579,6 +624,79 @@ bot.onText(/\/stats/, async (msg) => {
     await bot.sendMessage(chatId, stats, { parse_mode: 'HTML' });
 });
 
+bot.onText(/\/debug/, async (msg) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+
+    if (!isAdmin(userId)) {
+        return bot.sendMessage(chatId, `❌ Unauthorized. Your ID: ${userId}`);
+    }
+
+    const debugInfo = `
+🔍 <b>Debug Information</b>
+
+<b>Connection:</b>
+• RPC: ${SOLANA_RPC.substring(0, 50)}...
+• Status: ${connection ? '✅ Connected' : '❌ Disconnected'}
+
+<b>Last Checks:</b>
+• Processed Tokens: ${processedTokens.size}
+• Cached Tokens: ${tokenCache.size}
+• Last Request: ${new Date(lastRequestTime).toISOString()}
+
+<b>Running manual check...</b>
+`;
+
+    await bot.sendMessage(chatId, debugInfo, { parse_mode: 'HTML' });
+
+    // Manual check futtatása
+    try {
+        const testPools = await getNewPoolsFromDEX();
+        await bot.sendMessage(chatId, `Found ${testPools.length} DEX pools to check`, { parse_mode: 'HTML' });
+        
+        // Első pool ellenőrzése
+        if (testPools.length > 0) {
+            const firstPool = testPools[0];
+            await bot.sendMessage(chatId, `Checking pool: <code>${firstPool}</code>`, { parse_mode: 'HTML' });
+        }
+    } catch (error) {
+        await bot.sendMessage(chatId, `❌ Debug error: ${error.message}`, { parse_mode: 'HTML' });
+    }
+});
+
+bot.onText(/\/forcecheck/, async (msg) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+
+    if (!isAdmin(userId)) {
+        return bot.sendMessage(chatId, `❌ Unauthorized. Your ID: ${userId}`);
+    }
+
+    await bot.sendMessage(chatId, '🔄 Running forced check...', { parse_mode: 'HTML' });
+    
+    try {
+        await periodicCheck();
+        await bot.sendMessage(chatId, '✅ Forced check completed', { parse_mode: 'HTML' });
+    } catch (error) {
+        await bot.sendMessage(chatId, `❌ Error: ${error.message}`, { parse_mode: 'HTML' });
+    }
+});
+
+bot.onText(/\/clear/, async (msg) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+
+    if (!isAdmin(userId)) {
+        return bot.sendMessage(chatId, `❌ Unauthorized. Your ID: ${userId}`);
+    }
+
+    processedTokens.clear();
+    tokenCache.clear();
+    
+    await bot.sendMessage(chatId, '✅ Cache cleared successfully', { parse_mode: 'HTML' });
+    log('info', 'Cache manually cleared', { by: userId });
+});
+
 // ========================= WEBHOOK HANDLER =========================
 app.post('/webhook', async (req, res) => {
     try {
@@ -632,6 +750,126 @@ app.get('/health', (req, res) => {
     });
 });
 
+async function getNewPoolsFromDEX() {
+    try {
+        const newPools = [];
+        
+        // Raydium pool-ok ellenőrzése
+        const raydiumSigs = await connection.getSignaturesForAddress(
+            new PublicKey(RAYDIUM_AMM_V4),
+            { limit: 20 },
+            'confirmed'
+        );
+
+        for (const sig of raydiumSigs.slice(0, 5)) {
+            try {
+                const tx = await connection.getParsedTransaction(
+                    sig.signature,
+                    {
+                        commitment: 'confirmed',
+                        maxSupportedTransactionVersion: 0
+                    }
+                );
+
+                if (!tx || !tx.meta) continue;
+
+                // Pool létrehozás keresése
+                for (const log of (tx.meta.logMessages || [])) {
+                    if (log.includes('initialize2') || log.includes('InitializeInstruction')) {
+                        // Token címek kinyerése a tranzakcióból
+                        const accounts = tx.transaction.message.accountKeys;
+                        for (const account of accounts) {
+                            const pubkey = account.pubkey?.toString() || account.toString();
+                            if (!processedTokens.has(pubkey) && pubkey.length === 44) {
+                                newPools.push(pubkey);
+                                break;
+                            }
+                        }
+                    }
+                }
+            } catch (error) {
+                log('debug', 'Failed to process DEX signature', {
+                    signature: sig.signature,
+                    error: error.message
+                });
+            }
+        }
+
+        return newPools;
+    } catch (error) {
+        log('error', 'Failed to get new pools from DEX', { error: error.message });
+        return [];
+    }
+}
+
+async function getNewTokensFromJupiter() {
+    try {
+        // Jupiter token lista lekérése (ingyenes, nem kell API kulcs)
+        const response = await axios.get(
+            'https://token.jup.ag/all',
+            {
+                timeout: 10000,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0'
+                }
+            }
+        );
+
+        if (!response.data || !Array.isArray(response.data)) {
+            return [];
+        }
+
+        const tokens = response.data;
+        const newTokensToCheck = [];
+
+        // Csak az új tokeneket nézzük (amelyek még nincsenek a cache-ben)
+        for (const token of tokens.slice(0, 50)) { // Maximum 50 token ellenőrzése
+            if (!processedTokens.has(token.address) && token.name && token.symbol) {
+                newTokensToCheck.push({
+                    address: token.address,
+                    name: token.name,
+                    symbol: token.symbol,
+                    decimals: token.decimals
+                });
+            }
+        }
+
+        log('info', `Found ${newTokensToCheck.length} new tokens from Jupiter to check`);
+
+        const burnedTokens = [];
+        
+        // LP burn ellenőrzés
+        for (const token of newTokensToCheck.slice(0, 10)) { // Maximum 10 token részletes ellenőrzése
+            const burnStatus = await checkLPBurnViaExplorer(token.address);
+            
+            if (burnStatus.burned) {
+                burnedTokens.push({
+                    account: token.address,
+                    onChainMetadata: {
+                        metadata: {
+                            data: {
+                                name: token.name,
+                                symbol: token.symbol,
+                                decimals: token.decimals
+                            }
+                        }
+                    },
+                    burnStatus
+                });
+                processedTokens.add(token.address);
+            }
+            
+            // Kis késleltetés a rate limit miatt
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+
+        return burnedTokens;
+    } catch (error) {
+        log('error', 'Failed to get tokens from Jupiter', { error: error.message });
+        return [];
+    }
+}
+
 // ========================= PERIODIC CHECK =========================
 async function periodicCheck() {
     if (!botConfig.enabled) {
@@ -642,18 +880,59 @@ async function periodicCheck() {
     try {
         log('info', 'Starting periodic check');
         
-        // Alternatív módszer használata a rate limit elkerülésére
-        const newTokens = await getNewTokensAlternative();
+        // Három módszer kombinálása
+        const [chainTokens, dexPools, jupiterTokens] = await Promise.all([
+            getNewTokensAlternative(),
+            getNewPoolsFromDEX(),
+            getNewTokensFromJupiter()
+        ]);
 
-        if (newTokens.length > 0) {
-            log('info', `Found ${newTokens.length} new LP burn tokens`);
+        // Jupiter tokenek feldolgozása (ezek a legmegbízhatóbbak)
+        if (jupiterTokens.length > 0) {
+            log('info', `Found ${jupiterTokens.length} new LP burn tokens from Jupiter`);
             
-            for (const token of newTokens) {
+            for (const token of jupiterTokens) {
                 await sendTokenAlert(token);
-                // Kis késleltetés a Telegram rate limit miatt
                 await new Promise(resolve => setTimeout(resolve, 2000));
             }
-        } else {
+        }
+
+        // DEX pool-ok ellenőrzése
+        for (const poolAddress of dexPools) {
+            try {
+                const metadata = await getTokenMetadata(poolAddress);
+                if (metadata && metadata.onChainMetadata?.metadata?.data?.name) {
+                    const burnStatus = await checkLPBurnViaExplorer(poolAddress);
+                    
+                    if (burnStatus.burned && !processedTokens.has(poolAddress)) {
+                        await sendTokenAlert({
+                            account: poolAddress,
+                            ...metadata,
+                            burnStatus
+                        });
+                        processedTokens.add(poolAddress);
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                    }
+                }
+            } catch (error) {
+                log('debug', 'Failed to check pool', {
+                    pool: poolAddress,
+                    error: error.message
+                });
+            }
+        }
+
+        // Chain token-ek feldolgozása
+        if (chainTokens.length > 0) {
+            log('info', `Found ${chainTokens.length} new LP burn tokens from chain`);
+            
+            for (const token of chainTokens) {
+                await sendTokenAlert(token);
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            }
+        }
+
+        if (chainTokens.length === 0 && dexPools.length === 0 && jupiterTokens.length === 0) {
             log('info', 'No new LP burn tokens found');
         }
 
