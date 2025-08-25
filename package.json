@@ -1,35 +1,38 @@
 {
-  "name": "solana-lp-burn-bot",
+  "name": "solana-lp-burn-monitor-bot",
   "version": "1.0.0",
-  "description": "Solana LP Burn Tracker with Helius Webhook",
+  "description": "Telegram bot for monitoring Solana LP burn events with Helius webhook integration",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "build": "echo 'No build required'",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  },
+  "keywords": [
+    "solana",
+    "telegram",
+    "bot",
+    "liquidity",
+    "burn",
+    "defi",
+    "helius",
+    "webhook"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
-    "express": "^4.18.2",
-    "axios": "^1.6.0",
     "node-telegram-bot-api": "^0.64.0",
+    "express": "^4.18.2",
+    "axios": "^1.6.2",
+    "@solana/web3.js": "^1.87.6",
+    "node-cron": "^3.0.3",
     "dotenv": "^16.3.1"
   },
   "devDependencies": {
-    "nodemon": "^3.0.1"
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   }
 }
-
-// ============= .env MINTA =============
-// Hozz létre egy .env fájlt ezekkel a változókkal:
-
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_CHANNEL_ID=@your_channel_or_-1001234567890
-HELIUS_API_KEY=your_helius_api_key_here
-WEBHOOK_SECRET=your_secret_key_12345
-RENDER_EXTERNAL_URL=https://your-app.onrender.com
-MIN_LP_SOL=5
-MIN_MCAP=10000
-MAX_MCAP=1000000
-PORT=3000
