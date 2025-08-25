@@ -1,90 +1,72 @@
-import 'dotenv/config';
+import express from "express";
 import fetch from "node-fetch";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { Connection } from "@solana/web3.js";
+import TelegramBot from "node-telegram-bot-api";
 
-const connection = new Connection(process.env.RPC_ENDPOINT, "confirmed");
-const METADATA_PROGRAM_ID = new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"); // Metaplex
+const app = express();
+const port = process.env.PORT || 3000;
+
+// ENV változók (Render-en kell beállítani!)
+const RPC_URL = process.env.RPC_URL || "https://rpc.ankr.com/solana"; // vagy Helius
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+const connection = new Connection(RPC_URL, "confirmed");
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
 
 async function getTokenMetadata(mint) {
   try {
-    const [pda] = await PublicKey.findProgramAddress(
-      [
-        Buffer.from("metadata"),
-        METADATA_PROGRAM_ID.toBuffer(),
-        new PublicKey(mint).toBuffer(),
-      ],
-      METADATA_PROGRAM_ID
-    );
-
-    const accountInfo = await connection.getAccountInfo(pda);
-    if (accountInfo?.data) {
-      const name = accountInfo.data.toString().split("\u0000")[0]; 
-      return name;
-    }
-  } catch (e) {
-    console.log("Metadata fetch error:", e.message);
-  }
-  return null;
-}
-
-async function heliusLookup(mint) {
-  try {
-    const url = `https://api.helius.xyz/v0/token-metadata?api-key=${process.env.HELIUS_API_KEY}`;
-    const res = await fetch(url, {
+    const resp = await fetch(`${RPC_URL}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mintAccounts: [mint] })
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getAsset",
+        params: { id: mint }
+      })
     });
-    const data = await res.json();
-    return data[0]?.onChainMetadata?.metadata?.name || "Ismeretlen token";
-  } catch (e) {
-    console.log("Helius lookup hiba:", e.message);
-    return "Ismeretlen token";
+
+    const data = await resp.json();
+    if (data?.result?.content?.metadata) {
+      return {
+        name: data.result.content.metadata.name || "Unknown",
+        symbol: data.result.content.metadata.symbol || "???"
+      };
+    }
+    return { name: "Unknown", symbol: "???" };
+  } catch (err) {
+    console.error("Metadata fetch error:", err);
+    return { name: "Unknown", symbol: "???" };
   }
 }
 
-async function sendTelegram(msg) {
-  const url = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: process.env.TELEGRAM_CHAT_ID,
-      text: msg,
-      parse_mode: "Markdown"
-    })
+async function listenBurns() {
+  console.log("🚀 LP Burn figyelő indul...");
+
+  connection.onLogs("all", async (log) => {
+    const tx = log.signature;
+
+    // egyszerű burn detektálás log alapján
+    if (log.logs.some(l => l.includes("burn"))) {
+      console.log("[BURN] Esemény tx:", tx);
+
+      // Itt kéne az LP mint cím kinyerése a tranzakcióból -> most dummy
+      const mint = "SoMeMintAddressHere"; 
+
+      const meta = await getTokenMetadata(mint);
+
+      const msg = `🔥 LP Burn detected!\nToken: ${meta.name} (${meta.symbol})\nMint: ${mint}\nTx: https://solscan.io/tx/${tx}`;
+      console.log(msg);
+
+      if (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID) {
+        bot.sendMessage(TELEGRAM_CHAT_ID, msg);
+      }
+    }
   });
 }
 
-console.log("🚀 LP Burn figyelő elindult...");
+app.get("/", (req, res) => res.send("LP Burn listener running"));
+app.listen(port, () => console.log(`🌍 Server listening on ${port}`));
 
-connection.onLogs("all", async (log) => {
-  if (!log.logs) return;
-  if (log.logs.some(l => l.includes("Burn"))) {
-    const sig = log.signature;
-    console.log(`[BURN] esemény tx=${sig}`);
-
-    let tokenName = null;
-    try {
-      const tx = await connection.getParsedTransaction(sig, { maxSupportedTransactionVersion: 0 });
-      const mint = tx?.transaction?.message?.instructions?.[0]?.parsed?.info?.mint;
-
-      if (mint) {
-        tokenName = await getTokenMetadata(mint);
-        if (!tokenName) tokenName = await heliusLookup(mint);
-      }
-
-      const msg = `🔥 *LP Burn észlelve!*\n\nToken: ${tokenName || "Ismeretlen"}\nTx: https://solscan.io/tx/${sig}`;
-      await sendTelegram(msg);
-    } catch (e) {
-      console.log("Hiba feldolgozás közben:", e.message);
-    }
-  }
-});
-
-// Render healthcheck
-import http from "http";
-http.createServer((_, res) => {
-  res.writeHead(200);
-  res.end("LP Burn watcher fut ✅");
-}).listen(process.env.PORT || 10000);
+listenBurns();
