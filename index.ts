@@ -1,18 +1,17 @@
-import express, { Request, Response } from "express";
+import express from "express";
 import { Connection, clusterApiUrl, PublicKey } from "@solana/web3.js";
 import fetch from "node-fetch";
 
-// --- ENV változók (Render-en kell megadni) ---
 const PORT = process.env.PORT || 3000;
 const RPC_ENDPOINT = process.env.RPC_ENDPOINT || clusterApiUrl("mainnet-beta");
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 const app = express();
 const connection = new Connection(RPC_ENDPOINT, { commitment: "confirmed" });
 
-// --- Token név lekérdezése on-chain metadata alapján ---
-async function getTokenName(mint: string): Promise<string | null> {
+// --- Token név lekérdezése ---
+async function getTokenName(mint) {
   try {
     const metadataProgramId = new PublicKey(
       "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s" // Metaplex Metadata Program
@@ -45,7 +44,7 @@ async function getTokenName(mint: string): Promise<string | null> {
 }
 
 // --- Telegram üzenet küldés ---
-async function sendTelegramMessage(text: string) {
+async function sendTelegramMessage(text) {
   try {
     await fetch(
       `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
@@ -76,7 +75,7 @@ async function startBurnListener() {
       console.log("---------------------------------------------------");
       console.log(`[BURN] Burn esemény tx=${log.signature}`);
 
-      // Mint cím kinyerése a logból (egyszerű keresés)
+      // Mint cím keresése a logból
       const mintMatch = log.logs.find((l) => l.includes("mint:"));
       if (!mintMatch) {
         console.log("[WARN] Nem találtam mint címet a logban");
@@ -107,8 +106,8 @@ async function startBurnListener() {
   });
 }
 
-// --- Express keep-alive (Render miatt kell) ---
-app.get("/", (_: Request, res: Response) => {
+// --- Express keep-alive ---
+app.get("/", (req, res) => {
   res.send("LP Burn Bot is running ✅");
 });
 
