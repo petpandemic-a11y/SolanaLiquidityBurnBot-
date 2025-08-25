@@ -1,220 +1,162 @@
 import express from "express";
+import bodyParser from "body-parser";
 import fetch from "node-fetch";
+import { Connection, PublicKey } from "@solana/web3.js";
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(bodyParser.json());
 
-// ===== Beállítások =====
 const PORT = process.env.PORT || 10000;
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TG_CHAT = process.env.TELEGRAM_CHAT_ID;
-const HELIUS_SECRET = process.env.HELIUS_WEBHOOK_SECRET || null;
-const ENRICH = (process.env.ENRICH_WITH_DEXSCREENER || "true").toLowerCase() === "true";
-const DS_MIN_INTERVAL = Number(process.env.DEXSCREENER_MIN_INTERVAL_MS || 1500);
-const DS_TIMEOUT = Number(process.env.DEXSCREENER_TIMEOUT_MS || 4000);
 
-// Fő DEX programok (LP only)
-const PROGRAM_RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
-const PROGRAM_ORCA_WHIRLPOOLS = "9WFFm2i7TH4FzZ4PWzj1pYJKXxA9HBQ5fZVnK8hEJbbz";
-// Ha van pontos Pump.fun pool program ID-d, tedd ide:
-const PROGRAM_PUMPFUN = "Fg6PaFpoGXkYsidMpWxTWqkxhM8GdZ9XMBqMfmD9oeUo"; // példa – cseréld valódira, ha kell
+// ==== CONFIG ====
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+const HELIUS_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
 
-const DEX_PROGRAMS = new Set([
-  PROGRAM_RAYDIUM_AMM,
-  PROGRAM_ORCA_WHIRLPOOLS,
-  PROGRAM_PUMPFUN,
-]);
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// ===== Telegram helper =====
-async function sendTG(text) {
-  if (!TG_TOKEN || !TG_CHAT) {
-    console.warn("⚠️ Telegram adatok hiányoznak – nem posztolok.");
-    return;
-  }
-  const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
-  const body = { chat_id: TG_CHAT, text, parse_mode: "Markdown" };
+// Raydium AMM (pool program)
+const RAYDIUM_AMM = new PublicKey("675kPX9MHTjS2zt1c4uxszB5dLz7RQdq86UW2CeYcY8");
+
+// Solana kapcsolat
+const connection = new Connection(HELIUS_RPC, "confirmed");
+
+
+// ===== Helper: token metadata =====
+async function getTokenInfo(mint) {
   try {
-    const r = await fetch(url, {
+    const url = `https://api.helius.xyz/v0/token-metadata?api-key=${HELIUS_API_KEY}`;
+    const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ mintAccounts: [mint] })
     });
-    const j = await r.json();
-    if (!j.ok) console.error("❌ Telegram hiba:", j);
-    else console.log("📨 Üzenet elküldve Telegramra.");
+    const data = await resp.json();
+    if (data && data[0]) {
+      return {
+        name: data[0].onChainMetadata?.metadata?.data?.name || "Unknown",
+        symbol: data[0].onChainMetadata?.metadata?.data?.symbol || "???",
+        decimals: data[0].onChainMetadata?.metadata?.data?.decimals || 9,
+        supply: data[0].onChainMetadata?.supply || 0
+      };
+    }
+    return { name: "Unknown", symbol: "???", decimals: 9, supply: 0 };
   } catch (e) {
-    console.error("❌ Telegram fetch hiba:", e.message);
+    console.error("Token info fetch error:", e);
+    return { name: "Unknown", symbol: "???", decimals: 9, supply: 0 };
   }
 }
 
-// ===== DexScreener helper (cache + rate-limit) =====
-const pairCache = new Map(); // mint -> { data, ts }
-let lastDexScreenerCall = 0;
-
-async function safeDexScreenerByMint(mint) {
-  if (!ENRICH) return null;
-  const now = Date.now();
-
-  // Cache 6 órára
-  const cached = pairCache.get(mint);
-  if (cached && now - cached.ts < 6 * 60 * 60 * 1000) return cached.data;
-
-  // Rate-limit
-  const wait = lastDexScreenerCall + DS_MIN_INTERVAL - now;
-  if (wait > 0) await new Promise(r => setTimeout(r, wait));
-
-  const ctrl = new AbortController();
-  const to = setTimeout(() => ctrl.abort(), DS_TIMEOUT);
-
+// ===== Helper: Raydium pool adatlekérés (on-chain) =====
+async function getPoolPrice(lpMint) {
   try {
-    const resp = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { signal: ctrl.signal });
-    lastDexScreenerCall = Date.now();
-    clearTimeout(to);
-    if (!resp.ok) {
-      console.warn("DexScreener nem OK:", resp.status);
-      return null;
-    }
-    const data = await resp.json();
-    const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
-    // Csak akkor fogadjuk el, ha a mint valóban LP-hez tartozik valamely párban
-    const relevant = pairs.find(p =>
-      p?.lpToken?.address === mint || p?.baseToken?.address === mint || p?.quoteToken?.address === mint
-    );
-    pairCache.set(mint, { data: relevant || null, ts: Date.now() });
-    return relevant || null;
+    // Raydium pool account RPC query
+    const acc = await connection.getParsedAccountInfo(new PublicKey(lpMint));
+    if (!acc.value) return null;
+
+    // Példa: innen kinyerjük a reserve-eket (tokenA, tokenB)
+    const data = acc.value.data;
+    if (!data?.parsed?.info) return null;
+
+    const tokenA = parseFloat(data.parsed.info.tokenAmount.tokenAmount.amount);
+    const tokenB = parseFloat(data.parsed.info.tokenAmount.uiAmount);
+
+    // WSOL price fix (1 WSOL = 1 SOL)
+    // Token ár: SOL/token
+    const priceInSOL = tokenA > 0 && tokenB > 0 ? tokenA / tokenB : 0;
+
+    return { priceInSOL };
   } catch (e) {
-    clearTimeout(to);
-    console.warn("DexScreener hiba:", e.message);
+    console.error("Pool fetch error:", e);
     return null;
   }
 }
 
-// ===== LP Burn detektálás a Helius payloadból =====
-// Helius Enhanced webhook tipikusan: { type, timestamp, transactions: [ { signature, accountData, events, logMessages, ... } ] }
-function isFromKnownDex(tx) {
+// ===== Helper: SOL → USD ár (Coingecko) =====
+async function getSOLPrice() {
   try {
-    const keys = tx?.accountKeys || tx?.transaction?.message?.accountKeys || [];
-    const keyStrings = keys.map(k => (typeof k === "string" ? k : k?.toString?.() || k?.pubkey || "")); // toleráns
-    return keyStrings.some(k => DEX_PROGRAMS.has(k));
-  } catch {
-    return false;
-  }
-}
-
-function extractBurnsFromTx(tx) {
-  // Kikeressük az olyan parsed/inner instruction-öket, ahol type = 'burn'
-  const burns = [];
-
-  const allIxs = [
-    ...(tx?.transaction?.message?.instructions || []),
-    ...((tx?.meta?.innerInstructions || []).flatMap(ii => ii.instructions) || []),
-    ...(tx?.instructions || []), // Helius formátum
-  ];
-
-  for (const ix of allIxs) {
-    const parsed = ix?.parsed || ix?.data?.parsed || null;
-    const progId = ix?.programId || ix?.programIdIndex || ix?.program || null;
-
-    // Csak SPL Token burn (Token Program) – Helius parsed: parsed.type === 'burn'
-    const isBurn = parsed?.type?.toLowerCase?.() === "burn";
-    if (!isBurn) continue;
-
-    const info = parsed?.info || {};
-    const mint = info?.mint || info?.mintAccount || null;
-    const rawAmount = info?.amount || info?.tokenAmount || null;
-
-    burns.push({
-      mint,
-      amount: Number(rawAmount) || 0,
-      programRef: progId,
-    });
-  }
-  return burns;
-}
-
-// ===== Webhook endpoint =====
-app.post("/webhook", async (req, res) => {
-  // Gyors ACK, hogy ne legyen retry
-  res.status(200).send("ok");
-
-  try {
-    // Opcionális Secret ellenőrzés
-    if (HELIUS_SECRET) {
-      const inc = req.headers["x-hel-secrettoken"] || req.headers["x-hel-secret"] || "";
-      if (inc && inc !== HELIUS_SECRET) {
-        console.warn("⚠️ Secret mismatch – esemény eldobva.");
-        return;
-      }
-    }
-
-    const body = req.body;
-    if (!body) { console.warn("⚠️ Üres webhook body"); return; }
-
-    const txs = Array.isArray(body) ? body : (body?.transactions || body?.events || []);
-    if (!Array.isArray(txs) || txs.length === 0) { 
-      console.log("ℹ️ Nincs feldolgozható tranzakció ebben a batch-ben.");
-      return; 
-    }
-
-    for (const tx of txs) {
-      const sig = tx?.signature || tx?.transaction?.signatures?.[0] || "(ismeretlen)";
-      const fromDex = isFromKnownDex(tx);
-      if (!fromDex) {
-        // Kreditspórolás: csak DEX-es tx-eket nézünk tovább
-        continue;
-      }
-
-      const burns = extractBurnsFromTx(tx);
-      if (!burns.length) continue;
-
-      for (const b of burns) {
-        const mint = typeof b.mint === "string" ? b.mint : (b.mint?.toString?.() || null);
-        if (!mint) {
-          console.warn("[WARN] Burn talált, de nincs mint cím. Sig:", sig);
-          continue;
-        }
-
-        // Enrichment (cache-elt)
-        const pair = await safeDexScreenerByMint(mint);
-
-        // Üzenet összeállítás
-        let lines = [];
-        lines.push("🔥 *LP Burn észlelve!*");
-        lines.push(`Tx: https://solscan.io/tx/${sig}`);
-        lines.push(`Mint: \`${mint}\``);
-
-        if (pair) {
-          const base = `${pair.baseToken?.name || ""} (${pair.baseToken?.symbol || "?"})`;
-          const quote = pair.quoteToken?.symbol || "?";
-          lines.push(`Pool: *${base} / ${quote}*`);
-          if (b.amount) {
-            // LP token mennyiség – USD érték csak becslés, ha van priceUsd
-            const usd = pair.priceUsd ? (b.amount * Number(pair.priceUsd)).toFixed(2) : null;
-            lines.push(`Égetett LP: ${b.amount.toLocaleString()}${usd ? ` (~$${usd})` : ""}`);
-          }
-          if (pair?.liquidity?.usd) lines.push(`Likviditás: $${Number(pair.liquidity.usd).toLocaleString()}`);
-          if (pair?.fdv) lines.push(`FDV: $${Number(pair.fdv).toLocaleString()}`);
-          if (pair?.url) lines.push(`DexScreener: ${pair.url}`);
-        } else {
-          lines.push("_(Nincs DexScreener adat – cache/limit miatt vagy nem LP pár)_");
-        }
-
-        const msg = lines.join("\n");
-        console.log(`[BURN] ${sig} – ${mint}`);
-        await sendTG(msg);
-      }
-    }
+    const resp = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
+    const data = await resp.json();
+    return data.solana.usd || 0;
   } catch (e) {
-    console.error("🚨 Webhook feldolgozási hiba:", e.message);
+    console.error("SOL ár fetch error:", e);
+    return 0;
+  }
+}
+
+// ===== Telegram üzenet =====
+async function sendTelegramMessage(text) {
+  try {
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text })
+    });
+  } catch (e) {
+    console.error("Telegram hiba:", e);
+  }
+}
+
+
+// ===== Webhook feldolgozás =====
+app.post("/webhook", async (req, res) => {
+  try {
+    const txs = req.body;
+    for (const tx of txs) {
+      if (!tx.meta) continue;
+
+      const instructions = [
+        ...(tx.transaction?.message?.instructions || []),
+        ...(tx.meta?.innerInstructions?.flatMap(i => i.instructions) || [])
+      ];
+
+      for (const ix of instructions) {
+        if (ix?.parsed?.type === "burn") {
+          const mint = ix.parsed.info.mint;
+          const amount = ix.parsed.info.amount;
+
+          const tokenInfo = await getTokenInfo(mint);
+          const amountNormalized = amount / (10 ** tokenInfo.decimals);
+
+          // On-chain ár poolból
+          const poolPrice = await getPoolPrice(mint);
+          const solPrice = await getSOLPrice();
+
+          let valueSOL = 0;
+          let valueUSD = 0;
+          let marketCapUsd = 0;
+
+          if (poolPrice && poolPrice.priceInSOL > 0) {
+            valueSOL = amountNormalized * poolPrice.priceInSOL;
+            valueUSD = valueSOL * solPrice;
+
+            if (tokenInfo.supply > 0) {
+              const supply = tokenInfo.supply / (10 ** tokenInfo.decimals);
+              marketCapUsd = supply * poolPrice.priceInSOL * solPrice;
+            }
+          }
+
+          const msg = `🔥 LP Burn észlelve!\n\n` +
+                      `Token: ${tokenInfo.name} (${tokenInfo.symbol})\n` +
+                      `Égetett mennyiség: ${amountNormalized.toFixed(2)} ${tokenInfo.symbol}\n` +
+                      (valueSOL > 0 ? `Érték: ${valueSOL.toFixed(2)} SOL ($${valueUSD.toFixed(2)})\n` : "") +
+                      (marketCapUsd > 0 ? `MarketCap: $${marketCapUsd.toFixed(0)}\n` : "") +
+                      `Tx: https://solscan.io/tx/${tx.transaction.signatures[0]}`;
+
+          console.log(msg);
+          await sendTelegramMessage(msg);
+        }
+      }
+    }
+    res.status(200).send("ok");
+  } catch (e) {
+    console.error("Webhook feldolgozási hiba:", e);
+    res.status(500).send("error");
   }
 });
 
-// Healthcheck
-app.get("/", (_req, res) => res.send("LP burn webhook él ✅"));
 
-// Indítás
+// ===== Start =====
 app.listen(PORT, () => {
-  console.log(`✅ Server fut a ${PORT} porton`);
-  console.log("🌍 Webhook endpoint: POST /webhook");
-  console.log("🔒 Helius secret ellenőrzés:", HELIUS_SECRET ? "bekapcsolva" : "kikapcsolva");
+  console.log(`🚀 LP Burn bot fut a ${PORT} porton (on-chain pricing)`);
 });
