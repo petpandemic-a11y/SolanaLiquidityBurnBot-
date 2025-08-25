@@ -1,390 +1,606 @@
-// index.js - Teljes bot egyetlen fájlban
+const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const axios = require('axios');
-const TelegramBot = require('node-telegram-bot-api');
-require('dotenv').config();
+const { Connection, PublicKey } = require('@solana/web3.js');
+const cron = require('node-cron');
 
-// ============= KONFIGURÁCIÓ =============
-const CONFIG = {
-  // Telegram
-  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHANNEL_ID: process.env.TELEGRAM_CHANNEL_ID,
+// Környezeti változók betöltése (lokális fejlesztéshez)
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
+
+// Környezeti változók ellenőrzése induláskor
+function checkEnvironment() {
+  const required = ['TELEGRAM_BOT_TOKEN', 'HELIUS_API_KEY'];
+  const missing = required.filter(key => !process.env[key]);
   
-  // Helius
-  HELIUS_API_KEY: process.env.HELIUS_API_KEY,
-  WEBHOOK_SECRET: process.env.WEBHOOK_SECRET || 'my-secret-key-12345',
-  
-  // Szűrők
-  MIN_LP_SOL: parseFloat(process.env.MIN_LP_SOL || 5),
-  MIN_MCAP: parseFloat(process.env.MIN_MCAP || 10000),
-  MAX_MCAP: parseFloat(process.env.MAX_MCAP || 1000000),
-  
-  // Server
-  PORT: process.env.PORT || 3000,
-  SERVER_URL: process.env.RENDER_EXTERNAL_URL || 'http://localhost:3000'
+  if (missing.length > 0) {
+    console.error('❌ Hiányzó környezeti változók:', missing.join(', '));
+    console.log('💡 Állítsd be őket a Render Dashboard-on vagy .env fájlban');
+    
+    // Render környezetben nem állítjuk le, hogy a health check működjön
+    if (!process.env.RENDER) {
+      process.exit(1);
+    }
+  } else {
+    console.log('✅ Környezeti változók rendben');
+  }
+}
+
+// Ellenőrzés futtatása
+checkEnvironment();
+
+// Konfiguráció
+const config = {
+  telegramToken: process.env.TELEGRAM_BOT_TOKEN || 'YOUR_BOT_TOKEN',
+  heliusApiKey: process.env.HELIUS_API_KEY || 'YOUR_HELIUS_KEY',
+  solanaRpc: process.env.SOLANA_RPC || `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}`,
+  port: process.env.PORT || 10000, // Render alapértelmezett port
+  chatId: process.env.TELEGRAM_CHAT_ID || null,
+  webhookUrl: process.env.WEBHOOK_URL || process.env.RENDER_EXTERNAL_URL ? `${process.env.RENDER_EXTERNAL_URL}/webhook` : 'https://your-domain.com/webhook',
+  isProduction: process.env.NODE_ENV === 'production' || process.env.RENDER === 'true'
 };
 
-// ============= EXPRESS SZERVER =============
+// Bot inicializálás - Render környezetben webhook módot preferálunk
+const bot = config.isProduction && config.webhookUrl ? 
+  new TelegramBot(config.telegramToken, { webHook: true }) :
+  new TelegramBot(config.telegramToken, { polling: true });
+
 const app = express();
 app.use(express.json());
 
-// Telegram bot inicializálás
-const bot = new TelegramBot(CONFIG.TELEGRAM_BOT_TOKEN, { polling: false });
+// Solana kapcsolat
+const connection = new Connection(config.solanaRpc);
 
-// Cache a feldolgozott burn tranzakciókhoz
-const processedBurns = new Set();
-const tokenCache = new Map();
+// Szűrési beállítások (memóriában tárolva)
+let filterSettings = {
+  enabled: true,
+  minLiquidity: 1000, // USD értékben
+  checkInterval: 5, // percekben
+  trackOnlyNamed: true,
+  dexFilters: ['raydium', 'orca', 'meteora'],
+  minBurnPercentage: 99, // minimum burn százalék
+  alertChatIds: new Set(),
+  blacklistTokens: new Set(),
+  whitelistTokens: new Set()
+};
 
-// SOL ár cache
-let solPrice = 100;
+// LP burn események tárolása (duplikáció elkerülésére)
+const recentBurns = new Map();
 
-// ============= HELIUS WEBHOOK ENDPOINT =============
-app.post('/webhook', async (req, res) => {
-  try {
-    // Webhook biztonság ellenőrzése
-    if (req.headers['x-webhook-signature'] !== CONFIG.WEBHOOK_SECRET) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+// Ismert DEX program ID-k
+const DEX_PROGRAMS = {
+  raydium: '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
+  orca: '9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP',
+  meteora: 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo'
+};
 
-    const webhookData = req.body[0]; // Helius batch-ben küldi
-    
-    if (!webhookData) {
-      return res.status(200).json({ status: 'no data' });
-    }
-
-    // LP burn detektálás
-    const burnInfo = await detectLPBurn(webhookData);
-    
-    if (burnInfo && burnInfo.shouldNotify) {
-      await sendTelegramAlert(burnInfo);
-      processedBurns.add(webhookData.signature);
-    }
-    
-    res.status(200).json({ status: 'processed' });
-  } catch (error) {
-    console.error('Webhook error:', error);
-    res.status(200).json({ status: 'error', message: error.message });
-  }
-});
-
-// ============= LP BURN DETEKTÁLÁS =============
-async function detectLPBurn(txData) {
-  try {
-    const signature = txData.signature;
-    
-    // Ha már feldolgoztuk, skip
-    if (processedBurns.has(signature)) {
-      return null;
-    }
-    
-    // Burn instruction keresése
-    const instructions = txData.instructions || [];
-    let burnData = null;
-    
-    for (const inst of instructions) {
-      if (inst.programId === 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA') {
-        const parsed = inst.parsed;
-        if (parsed && (parsed.type === 'burn' || parsed.type === 'burnChecked')) {
-          burnData = parsed.info;
-          break;
-        }
-      }
-    }
-    
-    if (!burnData) return null;
-    
-    // Token információk lekérése
-    const tokenInfo = await getTokenInfo(burnData.mint || burnData.account);
-    
-    if (!tokenInfo) return null;
-    
-    // LP pool információk
-    const poolInfo = await getPoolInfo(tokenInfo.address);
-    
-    if (!poolInfo || !poolInfo.isLPToken) return null;
-    
-    // Burn százalék számítás
-    const burnPercentage = calculateBurnPercentage(burnData.amount, tokenInfo.supply);
-    
-    // Szűrők ellenőrzése
-    if (burnPercentage < 99.9) return null;
-    if (poolInfo.solValue < CONFIG.MIN_LP_SOL) return null;
-    if (poolInfo.marketCap < CONFIG.MIN_MCAP) return null;
-    if (poolInfo.marketCap > CONFIG.MAX_MCAP) return null;
-    
-    return {
-      shouldNotify: true,
-      signature,
-      tokenName: tokenInfo.name || 'Unknown',
-      tokenSymbol: tokenInfo.symbol || 'Unknown',
-      tokenAddress: tokenInfo.address,
-      burnPercentage,
-      solBurned: poolInfo.solValue,
-      marketCap: poolInfo.marketCap,
-      dexName: poolInfo.dexName || 'Unknown DEX',
-      timestamp: new Date().toISOString()
-    };
-  } catch (error) {
-    console.error('Detect LP burn error:', error);
-    return null;
-  }
-}
-
-// ============= TOKEN INFO LEKÉRÉS =============
-async function getTokenInfo(mintAddress) {
-  try {
-    // Cache ellenőrzés
-    if (tokenCache.has(mintAddress)) {
-      return tokenCache.get(mintAddress);
-    }
-    
-    // Helius API hívás
-    const response = await axios.post(
-      `https://api.helius.xyz/v0/token-metadata?api-key=${CONFIG.HELIUS_API_KEY}`,
-      {
-        mintAccounts: [mintAddress],
-        includeOffChain: true,
-        disableCache: false
-      }
-    );
-    
-    const data = response.data[0];
-    if (!data) return null;
-    
-    const tokenInfo = {
-      address: mintAddress,
-      name: data.onChainMetadata?.metadata?.name || data.offChainMetadata?.name,
-      symbol: data.onChainMetadata?.metadata?.symbol || data.offChainMetadata?.symbol,
-      supply: data.onChainMetadata?.supply || 0,
-      decimals: data.onChainMetadata?.decimals || 9
-    };
-    
-    // Cache tárolás 5 percre
-    tokenCache.set(mintAddress, tokenInfo);
-    setTimeout(() => tokenCache.delete(mintAddress), 300000);
-    
-    return tokenInfo;
-  } catch (error) {
-    console.error('Get token info error:', error);
-    return null;
-  }
-}
-
-// ============= POOL INFO LEKÉRÉS =============
-async function getPoolInfo(tokenAddress) {
-  try {
-    // Simplified pool detection - Helius DAS API
-    const response = await axios.post(
-      `https://api.helius.xyz/v0/addresses/${tokenAddress}/balances?api-key=${CONFIG.HELIUS_API_KEY}`
-    );
-    
-    const data = response.data;
-    
-    // SOL balance keresése
-    let solValue = 0;
-    const nativeBalance = data.nativeBalance || 0;
-    solValue = nativeBalance / 1e9; // Lamports to SOL
-    
-    // Market cap becslés
-    const marketCap = solValue * 2 * solPrice;
-    
-    // LP token detektálás (egyszerűsített)
-    const isLPToken = checkIfLPToken(tokenAddress, data);
-    
-    // DEX név meghatározása
-    const dexName = detectDEX(tokenAddress);
-    
-    return {
-      isLPToken,
-      solValue,
-      marketCap,
-      dexName
-    };
-  } catch (error) {
-    console.error('Get pool info error:', error);
-    return null;
-  }
-}
-
-// ============= SEGÉD FÜGGVÉNYEK =============
-function calculateBurnPercentage(burnAmount, totalSupply) {
-  if (!totalSupply || totalSupply === 0) return 0;
-  return (burnAmount / totalSupply) * 100;
-}
-
-function checkIfLPToken(address, data) {
-  // Egyszerűsített LP detektálás
-  // Ha van SOL és más token is, valószínűleg LP
-  const hasSOL = data.nativeBalance > 0;
-  const hasTokens = data.tokens && data.tokens.length > 0;
-  return hasSOL && hasTokens;
-}
-
-function detectDEX(address) {
-  // Egyszerűsített DEX detektálás
-  const addressStr = address.toLowerCase();
-  if (addressStr.includes('ray')) return 'Raydium';
-  if (addressStr.includes('orca')) return 'Orca';
-  if (addressStr.includes('jet')) return 'Jupiter';
-  return 'Unknown DEX';
-}
-
-async function updateSolPrice() {
+// Token metaadat lekérése
+async function getTokenMetadata(mintAddress) {
   try {
     const response = await axios.get(
-      'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd'
+      `https://api.helius.xyz/v0/token-metadata?api-key=${config.heliusApiKey}`,
+      { params: { mint: mintAddress } }
     );
-    solPrice = response.data.solana.usd;
-    console.log('SOL price updated:', solPrice);
+    return response.data;
   } catch (error) {
-    console.error('Update SOL price error:', error);
+    console.error(`Error fetching metadata for ${mintAddress}:`, error.message);
+    return null;
   }
 }
 
-// ============= TELEGRAM ÉRTESÍTÉS =============
-async function sendTelegramAlert(burnInfo) {
+// LP burn tranzakció ellenőrzése
+async function checkForLPBurns() {
+  if (!filterSettings.enabled) return;
+  
+  console.log('🔍 LP burn ellenőrzés indítása...');
+  
   try {
-    const message = `
-🔥 <b>100% LP BURN DETECTED!</b> 🔥
-
-💎 <b>Token:</b> ${burnInfo.tokenName} (${burnInfo.tokenSymbol})
-📍 <b>Address:</b> <code>${burnInfo.tokenAddress}</code>
-
-💰 <b>SOL Burned:</b> ${burnInfo.solBurned.toFixed(2)} SOL
-📊 <b>Market Cap:</b> $${burnInfo.marketCap.toLocaleString()}
-🔥 <b>Burn %:</b> ${burnInfo.burnPercentage.toFixed(1)}%
-🏦 <b>DEX:</b> ${burnInfo.dexName}
-
-🔗 <a href="https://solscan.io/tx/${burnInfo.signature}">View TX</a> | <a href="https://dexscreener.com/solana/${burnInfo.tokenAddress}">Chart</a>
-
-⚠️ DYOR - Not financial advice!
-`;
-
-    await bot.sendMessage(CONFIG.TELEGRAM_CHANNEL_ID, message, {
-      parse_mode: 'HTML',
-      disable_web_page_preview: false
-    });
+    // Elmúlt 5 perc tranzakcióinak lekérése
+    const endTime = Date.now();
+    const startTime = endTime - (filterSettings.checkInterval * 60 * 1000);
     
-    console.log('✅ Telegram alert sent:', burnInfo.tokenSymbol);
-  } catch (error) {
-    console.error('❌ Telegram send error:', error);
-  }
-}
-
-// ============= WEBHOOK REGISZTRÁCIÓ =============
-async function registerWebhook() {
-  try {
-    const webhookUrl = `${CONFIG.SERVER_URL}/webhook`;
-    
-    console.log('Registering webhook:', webhookUrl);
-    
+    // Helius Enhanced Transactions API használata
     const response = await axios.post(
-      `https://api.helius.xyz/v0/webhooks?api-key=${CONFIG.HELIUS_API_KEY}`,
+      `https://api.helius.xyz/v0/transactions?api-key=${config.heliusApiKey}`,
       {
-        webhookURL: webhookUrl,
-        transactionTypes: ['ENHANCED'],
-        accountAddresses: [], // Minden LP figyelése
-        webhookType: 'enhanced',
-        authHeader: CONFIG.WEBHOOK_SECRET,
-        encoding: 'jsonParsed',
-        commitment: 'confirmed',
-        // Szűrők a költségcsökkentéshez
-        filters: {
-          programIds: [
-            'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', // Token Program
-            '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium
-            '9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP'  // Orca
-          ]
+        query: {
+          type: 'BURN',
+          startTime: Math.floor(startTime / 1000),
+          endTime: Math.floor(endTime / 1000)
         }
       }
     );
     
-    console.log('✅ Webhook registered:', response.data.webhookID);
-    return response.data.webhookID;
-  } catch (error) {
-    console.error('❌ Webhook registration error:', error.response?.data || error);
+    const transactions = response.data.result || [];
     
-    // Ha már létezik webhook, listázzuk
+    for (const tx of transactions) {
+      await analyzeBurnTransaction(tx);
+    }
+    
+  } catch (error) {
+    console.error('❌ Hiba a burn ellenőrzés során:', error.message);
+  }
+}
+
+// Burn tranzakció elemzése
+async function analyzeBurnTransaction(tx) {
+  try {
+    // Ellenőrizzük, hogy LP token burn-e
+    const burnInstructions = tx.instructions?.filter(inst => 
+      inst.programId && Object.values(DEX_PROGRAMS).includes(inst.programId)
+    ) || [];
+    
+    if (burnInstructions.length === 0) return;
+    
+    // Token információk kinyerése
+    const tokenAccounts = tx.tokenTransfers || [];
+    
+    for (const transfer of tokenAccounts) {
+      if (transfer.toUserAccount === '11111111111111111111111111111111' || // Burn cím
+          transfer.toUserAccount === '1nc1nerator11111111111111111111111111111111') {
+        
+        const mintAddress = transfer.mint;
+        
+        // Duplikáció ellenőrzés
+        const burnKey = `${tx.signature}_${mintAddress}`;
+        if (recentBurns.has(burnKey)) continue;
+        
+        // Metadata lekérése
+        const metadata = await getTokenMetadata(mintAddress);
+        
+        if (!metadata) continue;
+        
+        // Szűrők alkalmazása
+        if (filterSettings.trackOnlyNamed && !metadata.name) continue;
+        if (filterSettings.blacklistTokens.has(mintAddress)) continue;
+        if (filterSettings.whitelistTokens.size > 0 && 
+            !filterSettings.whitelistTokens.has(mintAddress)) continue;
+        
+        // Burn százalék számítása
+        const burnPercentage = calculateBurnPercentage(transfer, metadata);
+        
+        if (burnPercentage >= filterSettings.minBurnPercentage) {
+          // Értesítés küldése
+          await sendBurnAlert({
+            txSignature: tx.signature,
+            tokenName: metadata.name || 'Unknown',
+            tokenSymbol: metadata.symbol || 'N/A',
+            mintAddress: mintAddress,
+            burnAmount: transfer.tokenAmount,
+            burnPercentage: burnPercentage,
+            dex: identifyDex(tx.instructions),
+            timestamp: new Date(tx.blockTime * 1000)
+          });
+          
+          // Burn rögzítése
+          recentBurns.set(burnKey, Date.now());
+        }
+      }
+    }
+  } catch (error) {
+    console.error('❌ Hiba a tranzakció elemzése során:', error.message);
+  }
+}
+
+// Burn százalék számítása
+function calculateBurnPercentage(transfer, metadata) {
+  try {
+    const burnAmount = parseFloat(transfer.tokenAmount);
+    const totalSupply = parseFloat(metadata.supply || 0);
+    
+    if (totalSupply === 0) return 0;
+    
+    return (burnAmount / totalSupply) * 100;
+  } catch {
+    return 0;
+  }
+}
+
+// DEX azonosítása
+function identifyDex(instructions) {
+  for (const [dexName, programId] of Object.entries(DEX_PROGRAMS)) {
+    if (instructions.some(inst => inst.programId === programId)) {
+      return dexName.toUpperCase();
+    }
+  }
+  return 'UNKNOWN';
+}
+
+// Telegram értesítés küldése
+async function sendBurnAlert(burnData) {
+  const message = `
+🔥 <b>LP BURN ÉSZLELVE!</b> 🔥
+
+📌 <b>Token:</b> ${burnData.tokenName} (${burnData.tokenSymbol})
+🏦 <b>DEX:</b> ${burnData.dex}
+💯 <b>Burn %:</b> ${burnData.burnPercentage.toFixed(2)}%
+💰 <b>Burn mennyiség:</b> ${formatNumber(burnData.burnAmount)}
+⏰ <b>Időpont:</b> ${burnData.timestamp.toLocaleString('hu-HU')}
+
+🔗 <b>Mint:</b> <code>${burnData.mintAddress}</code>
+📝 <b>TX:</b> <a href="https://solscan.io/tx/${burnData.txSignature}">Megtekintés</a>
+
+#LPBurn #${burnData.dex} #${burnData.tokenSymbol}
+`;
+  
+  // Értesítés küldése minden beállított chat-hez
+  for (const chatId of filterSettings.alertChatIds) {
     try {
-      const listResponse = await axios.get(
-        `https://api.helius.xyz/v0/webhooks?api-key=${CONFIG.HELIUS_API_KEY}`
-      );
-      console.log('Existing webhooks:', listResponse.data);
-    } catch (listError) {
-      console.error('List webhooks error:', listError);
+      await bot.sendMessage(chatId, message, { 
+        parse_mode: 'HTML',
+        disable_web_page_preview: false 
+      });
+    } catch (error) {
+      console.error(`❌ Nem sikerült üzenetet küldeni ${chatId} számára:`, error.message);
     }
   }
 }
 
-// ============= API ENDPOINTS =============
-app.get('/health', (req, res) => {
-  res.json({
+// Webhook endpoint Helius számára
+app.post('/webhook', async (req, res) => {
+  try {
+    console.log('📨 Webhook fogadva Helius-tól');
+    
+    // Helius webhook payload feldolgozása
+    const webhookData = req.body;
+    
+    if (webhookData.type === 'BURN' || webhookData.type === 'TRANSFER') {
+      await analyzeBurnTransaction(webhookData);
+    }
+    
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('❌ Webhook hiba:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Health check endpoint (Render számára)
+app.get('/', (req, res) => {
+  res.json({ 
     status: 'running',
-    config: {
-      MIN_LP_SOL: CONFIG.MIN_LP_SOL,
-      MIN_MCAP: CONFIG.MIN_MCAP,
-      MAX_MCAP: CONFIG.MAX_MCAP
-    },
-    processedBurns: processedBurns.size,
-    solPrice: solPrice,
-    uptime: process.uptime()
+    bot: 'Solana LP Burn Monitor',
+    monitoring: filterSettings.enabled,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
   });
 });
 
-app.get('/config', (req, res) => {
-  res.json({
-    MIN_LP_SOL: CONFIG.MIN_LP_SOL,
-    MIN_MCAP: CONFIG.MIN_MCAP,
-    MAX_MCAP: CONFIG.MAX_MCAP
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'healthy',
+    monitoring: filterSettings.enabled,
+    activeChats: filterSettings.alertChatIds.size
   });
 });
 
-app.post('/config', (req, res) => {
-  const { minSol, minMcap, maxMcap } = req.body;
+// Telegram parancsok
+bot.onText(/\/start/, async (msg) => {
+  const chatId = msg.chat.id;
+  filterSettings.alertChatIds.add(chatId.toString());
   
-  if (minSol !== undefined) CONFIG.MIN_LP_SOL = parseFloat(minSol);
-  if (minMcap !== undefined) CONFIG.MIN_MCAP = parseFloat(minMcap);
-  if (maxMcap !== undefined) CONFIG.MAX_MCAP = parseFloat(maxMcap);
+  const welcomeMessage = `
+🚀 <b>Solana LP Burn Monitor Bot</b>
+
+Üdvözöllek! Ez a bot figyeli a Solana LP párok burn eseményeit.
+
+📋 <b>Elérhető parancsok:</b>
+/status - Bot státusz és beállítások
+/enable - Monitoring bekapcsolása
+/disable - Monitoring kikapcsolása
+/setmin [összeg] - Min. likviditás beállítása (USD)
+/setinterval [perc] - Ellenőrzési időköz
+/setburn [%] - Min. burn százalék
+/adddex [név] - DEX hozzáadása
+/removedex [név] - DEX eltávolítása
+/blacklist [mint] - Token blacklist-re tétele
+/whitelist [mint] - Token whitelist-re tétele
+/clearfilters - Szűrők törlése
+/help - Súgó
+
+✅ Értesítések bekapcsolva erre a chat-re!
+`;
   
-  res.json({
-    success: true,
-    config: {
-      MIN_LP_SOL: CONFIG.MIN_LP_SOL,
-      MIN_MCAP: CONFIG.MIN_MCAP,
-      MAX_MCAP: CONFIG.MAX_MCAP
+  await bot.sendMessage(chatId, welcomeMessage, { parse_mode: 'HTML' });
+});
+
+bot.onText(/\/status/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  const statusMessage = `
+📊 <b>Bot Státusz</b>
+
+${filterSettings.enabled ? '✅ Monitoring: AKTÍV' : '❌ Monitoring: INAKTÍV'}
+
+⚙️ <b>Beállítások:</b>
+• Min. likviditás: $${filterSettings.minLiquidity}
+• Ellenőrzési időköz: ${filterSettings.checkInterval} perc
+• Min. burn %: ${filterSettings.minBurnPercentage}%
+• Csak nevesített tokenek: ${filterSettings.trackOnlyNamed ? 'IGEN' : 'NEM'}
+
+🏦 <b>Aktív DEX-ek:</b>
+${filterSettings.dexFilters.map(d => `• ${d.toUpperCase()}`).join('\n')}
+
+📊 <b>Szűrők:</b>
+• Blacklist tokenek: ${filterSettings.blacklistTokens.size} db
+• Whitelist tokenek: ${filterSettings.whitelistTokens.size} db
+• Aktív chat-ek: ${filterSettings.alertChatIds.size} db
+
+⏰ <b>Utolsó ellenőrzés:</b> ${new Date().toLocaleString('hu-HU')}
+`;
+  
+  await bot.sendMessage(chatId, statusMessage, { parse_mode: 'HTML' });
+});
+
+bot.onText(/\/enable/, async (msg) => {
+  const chatId = msg.chat.id;
+  filterSettings.enabled = true;
+  await bot.sendMessage(chatId, '✅ Monitoring bekapcsolva!');
+});
+
+bot.onText(/\/disable/, async (msg) => {
+  const chatId = msg.chat.id;
+  filterSettings.enabled = false;
+  await bot.sendMessage(chatId, '❌ Monitoring kikapcsolva!');
+});
+
+bot.onText(/\/setmin (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const amount = parseFloat(match[1]);
+  
+  if (isNaN(amount) || amount < 0) {
+    await bot.sendMessage(chatId, '❌ Érvénytelen összeg!');
+    return;
+  }
+  
+  filterSettings.minLiquidity = amount;
+  await bot.sendMessage(chatId, `✅ Min. likviditás beállítva: $${amount}`);
+});
+
+bot.onText(/\/setinterval (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const minutes = parseInt(match[1]);
+  
+  if (isNaN(minutes) || minutes < 1 || minutes > 60) {
+    await bot.sendMessage(chatId, '❌ Érvénytelen időköz! (1-60 perc)');
+    return;
+  }
+  
+  filterSettings.checkInterval = minutes;
+  
+  // Cron job újraindítása
+  cronJob.stop();
+  cronJob = cron.schedule(`*/${minutes} * * * *`, checkForLPBurns);
+  
+  await bot.sendMessage(chatId, `✅ Ellenőrzési időköz beállítva: ${minutes} perc`);
+});
+
+bot.onText(/\/setburn (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const percentage = parseFloat(match[1]);
+  
+  if (isNaN(percentage) || percentage < 0 || percentage > 100) {
+    await bot.sendMessage(chatId, '❌ Érvénytelen százalék! (0-100)');
+    return;
+  }
+  
+  filterSettings.minBurnPercentage = percentage;
+  await bot.sendMessage(chatId, `✅ Min. burn százalék beállítva: ${percentage}%`);
+});
+
+bot.onText(/\/adddex (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const dexName = match[1].toLowerCase();
+  
+  if (!DEX_PROGRAMS[dexName]) {
+    await bot.sendMessage(chatId, `❌ Ismeretlen DEX! Elérhető: ${Object.keys(DEX_PROGRAMS).join(', ')}`);
+    return;
+  }
+  
+  if (!filterSettings.dexFilters.includes(dexName)) {
+    filterSettings.dexFilters.push(dexName);
+  }
+  
+  await bot.sendMessage(chatId, `✅ ${dexName.toUpperCase()} hozzáadva a szűrőkhöz!`);
+});
+
+bot.onText(/\/removedex (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const dexName = match[1].toLowerCase();
+  
+  filterSettings.dexFilters = filterSettings.dexFilters.filter(d => d !== dexName);
+  await bot.sendMessage(chatId, `✅ ${dexName.toUpperCase()} eltávolítva a szűrőkből!`);
+});
+
+bot.onText(/\/blacklist (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const mintAddress = match[1];
+  
+  filterSettings.blacklistTokens.add(mintAddress);
+  await bot.sendMessage(chatId, `✅ Token hozzáadva a blacklist-hez:\n<code>${mintAddress}</code>`, 
+    { parse_mode: 'HTML' });
+});
+
+bot.onText(/\/whitelist (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const mintAddress = match[1];
+  
+  filterSettings.whitelistTokens.add(mintAddress);
+  await bot.sendMessage(chatId, `✅ Token hozzáadva a whitelist-hez:\n<code>${mintAddress}</code>`, 
+    { parse_mode: 'HTML' });
+});
+
+bot.onText(/\/clearfilters/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  filterSettings.blacklistTokens.clear();
+  filterSettings.whitelistTokens.clear();
+  
+  await bot.sendMessage(chatId, '✅ Minden szűrő törölve!');
+});
+
+bot.onText(/\/help/, async (msg) => {
+  const chatId = msg.chat.id;
+  
+  const helpMessage = `
+📚 <b>Részletes Súgó</b>
+
+<b>Alapvető parancsok:</b>
+• /start - Bot indítása és értesítések bekapcsolása
+• /status - Aktuális beállítások megtekintése
+• /enable - Monitoring bekapcsolása
+• /disable - Monitoring kikapcsolása
+
+<b>Szűrési beállítások:</b>
+• /setmin [USD] - Minimum likviditási küszöb
+• /setinterval [perc] - Ellenőrzési gyakoriság (1-60)
+• /setburn [%] - Minimum burn százalék (0-100)
+
+<b>DEX kezelés:</b>
+• /adddex [név] - DEX hozzáadása (raydium/orca/meteora)
+• /removedex [név] - DEX eltávolítása
+
+<b>Token szűrők:</b>
+• /blacklist [mint] - Token kizárása
+• /whitelist [mint] - Csak ezt a tokent figyelje
+• /clearfilters - Összes szűrő törlése
+
+<b>Működés:</b>
+A bot ${filterSettings.checkInterval} percenként ellenőrzi az LP burn eseményeket a Solana hálózaton. 
+Csak azokat az eseményeket jelzi, ahol a burn ${filterSettings.minBurnPercentage}% feletti.
+
+💡 <b>Tipp:</b> Használj whitelist-et specifikus tokenek követéséhez!
+`;
+  
+  await bot.sendMessage(chatId, helpMessage, { parse_mode: 'HTML' });
+});
+
+// Formázó függvény
+function formatNumber(num) {
+  if (num >= 1e9) return (num / 1e9).toFixed(2) + 'B';
+  if (num >= 1e6) return (num / 1e6).toFixed(2) + 'M';
+  if (num >= 1e3) return (num / 1e3).toFixed(2) + 'K';
+  return num.toFixed(2);
+}
+
+// Régi burn események tisztítása (24 óra után)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, timestamp] of recentBurns.entries()) {
+    if (now - timestamp > 24 * 60 * 60 * 1000) {
+      recentBurns.delete(key);
+    }
+  }
+}, 60 * 60 * 1000); // Óránként
+
+// Cron job az időzített ellenőrzésekhez
+let cronJob = cron.schedule(`*/${filterSettings.checkInterval} * * * *`, checkForLPBurns);
+
+// Helius webhook regisztráció
+async function registerHeliusWebhook() {
+  try {
+    // Render környezetben automatikus URL használata
+    const webhookUrl = config.webhookUrl || 
+                       (process.env.RENDER_EXTERNAL_URL ? 
+                        `${process.env.RENDER_EXTERNAL_URL}/webhook` : 
+                        'https://your-domain.com/webhook');
+    
+    console.log(`🔗 Webhook URL: ${webhookUrl}`);
+    
+    const response = await axios.post(
+      `https://api.helius.xyz/v0/webhooks?api-key=${config.heliusApiKey}`,
+      {
+        webhookURL: webhookUrl,
+        transactionTypes: ['BURN', 'TRANSFER'],
+        accountAddresses: Object.values(DEX_PROGRAMS),
+        webhookType: 'enhanced'
+      }
+    );
+    
+    console.log('✅ Helius webhook regisztrálva:', response.data);
+  } catch (error) {
+    console.error('❌ Webhook regisztráció sikertelen:', error.message);
+    // Production-ben ne álljon le a bot webhook hiba miatt
+    if (!config.isProduction) {
+      console.log('⚠️ Folytatás webhook nélkül (csak időzített ellenőrzés)');
+    }
+  }
+}
+
+// Alkalmazás indítása
+async function start() {
+  console.log('🚀 Solana LP Burn Monitor Bot indítása...');
+  
+  // Render környezet info
+  if (process.env.RENDER) {
+    console.log('📍 Környezet: Render.com');
+    console.log(`🔗 Service URL: ${process.env.RENDER_EXTERNAL_URL || 'Nincs beállítva'}`);
+  }
+  
+  // Express szerver indítása
+  app.listen(config.port, () => {
+    console.log(`📡 Webhook szerver fut: ${config.port} porton`);
+    if (process.env.RENDER_EXTERNAL_URL) {
+      console.log(`🌐 Publikus URL: ${process.env.RENDER_EXTERNAL_URL}`);
     }
   });
+  
+  // Helius webhook regisztráció
+  await registerHeliusWebhook();
+  
+  // Első ellenőrzés
+  await checkForLPBurns();
+  
+  // Keep-alive mechanizmus Render free tier-hez (14 percenként ping)
+  if (process.env.RENDER && process.env.RENDER_EXTERNAL_URL) {
+    setInterval(() => {
+      axios.get(`${process.env.RENDER_EXTERNAL_URL}/health`)
+        .then(() => console.log('🏓 Keep-alive ping sikeres'))
+        .catch(() => console.log('⚠️ Keep-alive ping sikertelen'));
+    }, 14 * 60 * 1000); // 14 perc
+  }
+  
+  console.log('✅ Bot sikeresen elindult!');
+  console.log(`⏰ Ellenőrzés ${filterSettings.checkInterval} percenként`);
+  console.log('💬 Használd a /start parancsot Telegramban a bot aktiválásához!');
+}
+
+// Bot indítása
+start().catch(error => {
+  console.error('❌ Kritikus hiba a bot indításakor:', error);
+  // Render környezetben hagyjuk futni a szervert a health check miatt
+  if (!process.env.RENDER) {
+    process.exit(1);
+  }
 });
 
-// ============= SZERVER INDÍTÁS =============
-app.listen(CONFIG.PORT, async () => {
-  console.log('================================');
-  console.log('🚀 Solana LP Burn Tracker Bot');
-  console.log('================================');
-  console.log(`📡 Server: http://localhost:${CONFIG.PORT}`);
-  console.log(`📊 Min SOL: ${CONFIG.MIN_LP_SOL}`);
-  console.log(`💰 MCap: $${CONFIG.MIN_MCAP} - $${CONFIG.MAX_MCAP}`);
-  console.log('================================');
-  
-  // Webhook regisztráció
-  await registerWebhook();
-  
-  // SOL ár frissítése
-  await updateSolPrice();
-  setInterval(updateSolPrice, 60000); // Percenként frissít
-  
-  // Cache tisztítás naponta
-  setInterval(() => {
-    processedBurns.clear();
-    tokenCache.clear();
-    console.log('🧹 Cache cleared');
-  }, 86400000);
-  
-  console.log('✅ Bot is ready and listening for LP burns!');
+// Kezeletlen hibák kezelése
+process.on('unhandledRejection', (error) => {
+  console.error('❌ Kezeletlen Promise rejection:', error);
 });
 
-// ============= GRACEFUL SHUTDOWN =============
+process.on('uncaughtException', (error) => {
+  console.error('❌ Kezeletlen kivétel:', error);
+  // Kritikus hiba esetén újraindítás
+  if (process.env.RENDER) {
+    console.log('🔄 Újraindítás 5 másodperc múlva...');
+    setTimeout(() => process.exit(1), 5000);
+  }
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\n👋 Bot leállítása...');
+  bot.stopPolling();
+  cronJob.stop();
+  process.exit(0);
+});
+
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully...');
+  console.log('\n👋 Bot leállítása (SIGTERM)...');
+  bot.stopPolling();
+  cronJob.stop();
   process.exit(0);
 });
