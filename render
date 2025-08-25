@@ -1,0 +1,39 @@
+services:
+  # Web Service a bot futtatásához
+  - type: web
+    name: solana-lp-burn-bot
+    runtime: node
+    region: oregon # vagy frankfurt, ohio, singapore
+    plan: free # vagy starter ($7/hó), standard ($25/hó)
+    
+    # Build parancs
+    buildCommand: npm install
+    
+    # Start parancs
+    startCommand: npm start
+    
+    # Health check beállítások
+    healthCheckPath: /health
+    
+    # Környezeti változók
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: RENDER
+        value: true
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false # Manuálisan add meg a Render dashboardon
+      - key: HELIUS_API_KEY
+        sync: false # Manuálisan add meg a Render dashboardon
+      - key: TELEGRAM_CHAT_ID
+        sync: false # Opcionális
+      
+    # Auto-deploy GitHub-ról (opcionális)
+    autoDeploy: true
+    
+    # Scaling beállítások
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+      targetMemoryPercent: 80
+      targetCPUPercent: 80
