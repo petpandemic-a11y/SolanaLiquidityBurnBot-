@@ -1,4 +1,4 @@
-import express from "express";
+import express, { Request, Response } from "express";
 import { Connection, clusterApiUrl, PublicKey } from "@solana/web3.js";
 import fetch from "node-fetch";
 
@@ -108,7 +108,9 @@ async function startBurnListener() {
 }
 
 // --- Express keep-alive (Render miatt kell) ---
-app.get("/", (_, res) => res.send("LP Burn Bot is running ✅"));
+app.get("/", (_: Request, res: Response) => {
+  res.send("LP Burn Bot is running ✅");
+});
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
