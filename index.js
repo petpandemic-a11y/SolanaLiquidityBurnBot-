@@ -1,28 +1,39 @@
-import express from "express";
-import fetch from "node-fetch";
 import { Connection } from "@solana/web3.js";
+import fetch from "node-fetch";
+import express from "express";
 import dotenv from "dotenv";
 
 dotenv.config();
 
-// === CONFIG ===
-const RPC_URL = process.env.RPC_URL || "https://api.mainnet-beta.solana.com"; // saját RPC / helius is mehet
-const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN; // Telegram bot token
-const TG_CHAT_ID = process.env.TG_CHAT_ID;     // Csatorna/chat ID
-
-// === INIT ===
 const app = express();
 const PORT = process.env.PORT || 10000;
-const connection = new Connection(RPC_URL, "confirmed");
 
-// === TELEGRAM SENDER ===
+// RPC URL envből vagy fallback a Solana mainnet alap URL-re
+const RPC_URL = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
+const connection = new Connection(RPC_URL, {
+  commitment: "confirmed",
+  disableRetryOnRateLimit: false
+});
+
+console.log(`🔗 RPC URL: ${RPC_URL}`);
+console.log(`🌍 Server listening on ${PORT}`);
+
+app.listen(PORT, () => {
+  console.log("🚀 LP Burn figyelő indul...");
+});
+
+// Telegram config
+const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
+const TG_CHAT_ID = process.env.TG_CHAT_ID;
+
 async function sendToTelegram(message) {
   if (!TG_BOT_TOKEN || !TG_CHAT_ID) {
-    console.log("❌ Telegram config hiányzik");
+    console.warn("⚠️ Telegram adatok hiányoznak, nem tudok posztolni");
     return;
   }
   try {
-    await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+    const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
+    await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -31,69 +42,42 @@ async function sendToTelegram(message) {
         parse_mode: "Markdown"
       })
     });
-  } catch (e) {
-    console.error("❌ Telegram hiba:", e.message);
+    console.log("📩 Üzenet elküldve Telegramra");
+  } catch (err) {
+    console.error("❌ Telegram hiba:", err);
   }
 }
 
-// === LP BURN LISTENER ===
-async function listenBurns() {
-  console.log("🚀 LP Burn figyelő indul...");
+// Burn figyelő (polling példa)
+async function checkBurn(txSig) {
+  try {
+    const txRes = await connection.getTransaction(txSig, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0
+    });
 
-  connection.onLogs("all", async (log) => {
-    try {
-      if (!log.logs) return;
+    if (!txRes || !txRes.meta) return;
 
-      // Burn instruction keresése
-      const isBurn = log.logs.some(l => l.includes("Instruction: Burn"));
-      if (!isBurn) return;
-
-      // Tranzakció részletek betöltése
-      const txSig = log.signature;
-      const txRes = await connection.getTransaction(txSig, { commitment: "confirmed" });
-      if (!txRes) return;
-
-      const { meta } = txRes;
-      let mint = "Unknown";
-      let tokenName = "Unknown";
-
-      // Mint cím kinyerése
-      if (meta && meta.preTokenBalances && meta.preTokenBalances.length > 0) {
-        mint = meta.preTokenBalances[0].mint;
-      }
-
-      // Token nevet Dexscreener API-ból (ha kell)
-      try {
-        const ds = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-        const data = await ds.json();
-        if (data.pairs && data.pairs.length > 0) {
-          tokenName = data.pairs[0].baseToken.symbol || "Unknown";
-        }
-      } catch (e) {
-        console.log("⚠️ Dexscreener hiba:", e.message);
-      }
-
-      // Üzenet
-      const msg = `
-🔥 *LP Burn detected!*
-🪙 Token: ${tokenName}  
-🧾 Mint: \`${mint}\`  
-🔗 [Solscan](https://solscan.io/tx/${txSig})
-      `;
-
-      console.log(msg);
-      await sendToTelegram(msg);
-
-    } catch (err) {
-      console.error("❌ Hiba burn feldolgozásnál:", err.message);
+    // Token mint kiszedése
+    let mint = "Unknown";
+    if (
+      txRes.meta.preTokenBalances &&
+      txRes.meta.preTokenBalances.length > 0
+    ) {
+      mint = txRes.meta.preTokenBalances[0].mint;
     }
-  });
+
+    const message = `🔥 *LP Burn észlelve!*\nMint: \`${mint}\`\nTx: https://solscan.io/tx/${txSig}`;
+    console.log(message);
+    await sendToTelegram(message);
+  } catch (err) {
+    console.error("❌ Hiba burn feldolgozásnál:", err.message);
+  }
 }
 
-// === SERVER ===
-app.get("/", (_, res) => res.send("🚀 LP Burn bot fut!"));
-
-app.listen(PORT, () => {
-  console.log(`🌍 Server listening on ${PORT}`);
-  listenBurns();
-});
+// Teszt kedvéért itt meghívsz egy konkrét tx hash-t (pl. ismert LP burn tx)
+(async () => {
+  const testTx = "3uuhvpJz4w2Sg9ujTA7YtrmivBPeaQFLrTLprGhgLq4mmCGc6mtvvfdix8PJP42M42YEF1ECfkr5jKUSixU9Uqwz";
+  console.log(`🔍 Teszt tranzakció ellenőrzés: ${testTx}`);
+  await checkBurn(testTx);
+})();
