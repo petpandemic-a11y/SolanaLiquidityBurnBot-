@@ -1,38 +1,34 @@
 {
-  "name": "solana-lp-burn-monitor-bot",
+  "name": "solana-lpburn-telegram-bot",
   "version": "1.0.0",
-  "description": "Telegram bot for monitoring Solana LP burn events with Helius webhook integration",
+  "description": "Telegram bot for monitoring Solana LP burn events",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "build": "echo 'No build required'",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
     "solana",
     "telegram",
     "bot",
-    "liquidity",
-    "burn",
-    "defi",
-    "helius",
-    "webhook"
+    "crypto",
+    "lpburn",
+    "defi"
   ],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "node-telegram-bot-api": "^0.64.0",
+    "@solana/web3.js": "^1.91.1",
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.1",
     "express": "^4.18.2",
-    "axios": "^1.6.2",
-    "@solana/web3.js": "^1.87.6",
-    "node-cron": "^3.0.3",
-    "dotenv": "^16.3.1"
+    "node-telegram-bot-api": "^0.64.0"
   },
   "devDependencies": {
-    "nodemon": "^3.0.2"
+    "nodemon": "^3.0.3"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18.0.0"
   }
 }
