@@ -2,13 +2,27 @@ import express from "express";
 import fetch from "node-fetch";
 import { Connection, PublicKey } from "@solana/web3.js";
 
-const RPC_URL = process.env.RPC_URL;
+const FREE_RPC = "https://rpc.ankr.com/solana"; // ingyenes public RPC
+const HELIUS_RPC = process.env.HELIUS_RPC_URL;  // fallback RPC (pl. helius)
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const PORT = process.env.PORT || 10000;
 
-const connection = new Connection(RPC_URL, { commitment: "confirmed" });
+let connection = new Connection(FREE_RPC, { commitment: "confirmed" });
+let usingHelius = false;
+
 const app = express();
+
+// === DEX LP pool címlista ===
+const LP_ADDRESSES = [
+  // Raydium
+  "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", // Raydium AMM authority
+  // Orca
+  "9WFFm2i7TH4FzZ4PWzj1pYJKXxA9HBQ5fZVnK8hEJbbz", // Orca Whirlpools program
+  // Pump.fun
+  "Fg6PaFpoGXkYsidMpWxTWqkxhM8GdZ9XMBqMfmD9oeUo", // Pump.fun (példa)
+  // Ha van még több konkrét LP pool címed, ide tudod betenni
+].map(a => new PublicKey(a));
 
 // === Telegram üzenet küldő ===
 async function sendTelegram(msg) {
@@ -29,18 +43,30 @@ async function getTokenInfo(mint) {
   try {
     const url = `https://api.dexscreener.com/latest/dex/tokens/${mint}`;
     const res = await fetch(url);
+    if (res.status === 429) {
+      console.warn("DexScreener limit! Skipping...");
+      return [];
+    }
     const data = await res.json();
-
     if (data.pairs && data.pairs.length > 0) {
-      return data.pairs; // tömb, több pár is lehet
+      return data.pairs;
     }
   } catch (err) {
-    console.error("Dexscreener error:", err);
+    console.error("DexScreener error:", err);
   }
   return [];
 }
 
-// === LP Burn figyelő ===
+// === RPC váltás, ha baj van ===
+function switchToHelius() {
+  if (!usingHelius && HELIUS_RPC) {
+    console.warn("⚠️ Átváltás Helius RPC-re...");
+    connection = new Connection(HELIUS_RPC, { commitment: "confirmed" });
+    usingHelius = true;
+  }
+}
+
+// === LP Burn feldolgozó ===
 async function handleBurn(signature) {
   try {
     const tx = await connection.getParsedTransaction(signature, {
@@ -48,11 +74,9 @@ async function handleBurn(signature) {
     });
     if (!tx) return;
 
-    // Csak akkor, ha Burn történt
     const logMsg = tx.meta?.logMessages?.join(" ") || "";
     if (!logMsg.toLowerCase().includes("burn")) return;
 
-    // Burn instruction kiszedése
     const burnInst = tx.transaction.message.instructions.find(
       ix => ix.parsed?.type === "burn"
     );
@@ -61,20 +85,18 @@ async function handleBurn(signature) {
     const mint = burnInst.parsed.info.mint;
     const amount = Number(burnInst.parsed.info.amount) / 1e9;
 
-    // Token infók
     const pairs = await getTokenInfo(mint);
-    if (pairs.length === 0) return; // nincs Dexscreener adat
+    if (pairs.length === 0) return;
 
-    // Csak akkor, ha LP tokenről van szó
+    // Csak LP tokenek szűrése
     const lpPair = pairs.find(
       p =>
+        p.lpToken?.address === mint ||
         p.baseToken.address === mint ||
-        p.quoteToken.address === mint ||
-        p.lpToken?.address === mint
+        p.quoteToken.address === mint
     );
-    if (!lpPair) return; // nem LP burn, skip
+    if (!lpPair) return;
 
-    // Üzenet összerakás
     const burnUsd = (amount * parseFloat(lpPair.priceUsd || 0)).toFixed(2);
     let msg = `🔥 *Új LP Burn észlelve!*\n[Solscan Tx](https://solscan.io/tx/${signature})`;
 
@@ -86,24 +108,25 @@ async function handleBurn(signature) {
     msg += `\n[DexScreener link](${lpPair.url})`;
 
     await sendTelegram(msg);
-    console.log("LP Burn kiküldve TG-re:", msg);
+    console.log("✅ LP Burn kiküldve:", msg);
   } catch (err) {
-    console.error("Burn feldolgozási hiba:", err);
+    console.error("Burn feldolgozási hiba:", err.message);
+    switchToHelius(); // ha hiba, akkor váltson Heliusra
   }
 }
 
-// === Dummy polling (cseréld LP pool address figyelésre) ===
+// === Poolok figyelése ===
 setInterval(async () => {
-  try {
-    const sigs = await connection.getSignaturesForAddress(
-      new PublicKey("11111111111111111111111111111111"), // TODO: LP pool root címlista
-      { limit: 5 }
-    );
-    for (const s of sigs) {
-      await handleBurn(s.signature);
+  for (const lp of LP_ADDRESSES) {
+    try {
+      const sigs = await connection.getSignaturesForAddress(lp, { limit: 5 });
+      for (const s of sigs) {
+        await handleBurn(s.signature);
+      }
+    } catch (e) {
+      console.error("Signature lekérés hiba:", e.message);
+      switchToHelius();
     }
-  } catch (e) {
-    console.error("Signature lekérés hiba:", e);
   }
 }, 30000);
 
