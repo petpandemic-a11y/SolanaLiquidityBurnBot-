@@ -32,20 +32,12 @@ async function getTokenInfo(mint) {
     const data = await res.json();
 
     if (data.pairs && data.pairs.length > 0) {
-      const pair = data.pairs[0];
-      return {
-        name: pair.baseToken.name,
-        symbol: pair.baseToken.symbol,
-        priceUsd: parseFloat(pair.priceUsd),
-        fdv: parseFloat(pair.fdv),
-        liquidityUsd: parseFloat(pair.liquidity.usd),
-        pairUrl: pair.url
-      };
+      return data.pairs; // tömb, több pár is lehet
     }
   } catch (err) {
     console.error("Dexscreener error:", err);
   }
-  return null;
+  return [];
 }
 
 // === LP Burn figyelő ===
@@ -60,43 +52,51 @@ async function handleBurn(signature) {
     const logMsg = tx.meta?.logMessages?.join(" ") || "";
     if (!logMsg.toLowerCase().includes("burn")) return;
 
-    // Megnézzük a Burn instructionokat
+    // Burn instruction kiszedése
     const burnInst = tx.transaction.message.instructions.find(
       ix => ix.parsed?.type === "burn"
     );
     if (!burnInst) return;
 
     const mint = burnInst.parsed.info.mint;
-    const amount = Number(burnInst.parsed.info.amount) / 1e9; // SPL token decimals feltételezve 9
+    const amount = Number(burnInst.parsed.info.amount) / 1e9;
 
-    const tokenInfo = await getTokenInfo(mint);
+    // Token infók
+    const pairs = await getTokenInfo(mint);
+    if (pairs.length === 0) return; // nincs Dexscreener adat
 
-    let msg = `🔥 *LP Burn észlelve!*\n[Solscan Tx](https://solscan.io/tx/${signature})`;
+    // Csak akkor, ha LP tokenről van szó
+    const lpPair = pairs.find(
+      p =>
+        p.baseToken.address === mint ||
+        p.quoteToken.address === mint ||
+        p.lpToken?.address === mint
+    );
+    if (!lpPair) return; // nem LP burn, skip
 
-    if (tokenInfo) {
-      // USD érték számítása
-      const burnUsd = (amount * tokenInfo.priceUsd).toFixed(2);
-      msg += `\n\n*Token:* ${tokenInfo.name} (${tokenInfo.symbol})`;
-      msg += `\nÉgetett mennyiség: ${amount.toFixed(4)} ${tokenInfo.symbol}`;
-      msg += `\nÉrték: ~${burnUsd} USD`;
-      msg += `\nMCap: $${tokenInfo.fdv.toLocaleString()}`;
-      msg += `\nLikviditás: $${tokenInfo.liquidityUsd.toLocaleString()}`;
-      msg += `\n[DexScreener link](${tokenInfo.pairUrl})`;
-    }
+    // Üzenet összerakás
+    const burnUsd = (amount * parseFloat(lpPair.priceUsd || 0)).toFixed(2);
+    let msg = `🔥 *Új LP Burn észlelve!*\n[Solscan Tx](https://solscan.io/tx/${signature})`;
+
+    msg += `\n\n*Pool:* ${lpPair.baseToken.name} (${lpPair.baseToken.symbol}) / ${lpPair.quoteToken.symbol}`;
+    msg += `\nÉgetett LP token: ${amount.toFixed(4)}`;
+    if (burnUsd > 0) msg += `\nÉrték: ~${burnUsd} USD`;
+    msg += `\nLikviditás: $${lpPair.liquidity.usd.toLocaleString()}`;
+    msg += `\nMCap: $${lpPair.fdv.toLocaleString()}`;
+    msg += `\n[DexScreener link](${lpPair.url})`;
 
     await sendTelegram(msg);
-    console.log("Kiküldve TG-re:", msg);
+    console.log("LP Burn kiküldve TG-re:", msg);
   } catch (err) {
     console.error("Burn feldolgozási hiba:", err);
   }
 }
 
-// === Példa: random signature figyelés (cron-szerű loop) ===
-// TODO: majd LP pool accountok figyelése kell ide, most teszt dummy
+// === Dummy polling (cseréld LP pool address figyelésre) ===
 setInterval(async () => {
   try {
     const sigs = await connection.getSignaturesForAddress(
-      new PublicKey("11111111111111111111111111111111"), // dummy address
+      new PublicKey("11111111111111111111111111111111"), // TODO: LP pool root címlista
       { limit: 5 }
     );
     for (const s of sigs) {
@@ -108,5 +108,5 @@ setInterval(async () => {
 }, 30000);
 
 // Render keepalive
-app.get("/", (_, res) => res.send("LP Burn bot fut 🚀"));
+app.get("/", (_, res) => res.send("Csak LP Burn figyelés aktív 🚀"));
 app.listen(PORT, () => console.log(`Bot elindult a ${PORT} porton`));
