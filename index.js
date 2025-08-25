@@ -192,31 +192,17 @@ async function getRecentTransactions() {
 
 async function checkLPBurnViaExplorer(tokenAddress) {
     try {
-        // Először próbáljuk a Jupiter Stats API-t (ingyenes, nem kell kulcs)
-        try {
-            const jupiterResponse = await axios.get(
-                `https://stats.jup.ag/liquidity/v1/tokens/${tokenAddress}`,
-                {
-                    timeout: 5000,
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0'
-                    }
-                }
-            );
-
-            if (jupiterResponse.data) {
-                // Jupiter adatok elemzése
-                const liquidityData = jupiterResponse.data;
-                if (liquidityData.liquidity && liquidityData.liquidity === 0) {
-                    return {
-                        burned: true,
-                        percentage: 100,
-                        source: 'Jupiter'
-                    };
-                }
-            }
-        } catch (jupiterError) {
-            log('debug', 'Jupiter API not available', { tokenAddress });
+        // Speciális tokenek kiszűrése
+        const excludeTokens = [
+            'So11111111111111111111111111111111111111112',
+            'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+            'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+            'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn',
+            'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So'
+        ];
+        
+        if (excludeTokens.includes(tokenAddress)) {
+            return { burned: false, percentage: 0, reason: 'Major token excluded' };
         }
 
         // Solscan API használata (ingyenes, nem igényel API kulcsot)
@@ -433,20 +419,42 @@ async function sendTokenAlert(tokenData) {
             account, 
             onChainMetadata, 
             offChainMetadata,
-            burnStatus 
+            burnStatus,
+            additionalInfo 
         } = tokenData;
 
         const name = onChainMetadata?.metadata?.data?.name || offChainMetadata?.name || 'Unknown';
         const symbol = onChainMetadata?.metadata?.data?.symbol || offChainMetadata?.symbol || 'N/A';
 
         // Üzenet összeállítása
-        const message = `
+        let message = `
 🔥 <b>100% LP BURN DETECTED!</b> 🔥
 
 📌 <b>Token:</b> ${name} (${symbol})
 🏷️ <b>Contract:</b> <code>${account}</code>
-🔥 <b>LP Burn:</b> ${burnStatus.percentage.toFixed(1)}%
-💰 <b>Burned Amount:</b> ${burnStatus.totalBurned ? formatNumber(burnStatus.totalBurned) : 'N/A'}
+🔥 <b>LP Burn:</b> ${burnStatus.percentage.toFixed(1)}%`;
+
+        // Ha van további info
+        if (additionalInfo) {
+            if (additionalInfo.liquidity) {
+                message += `\n💰 <b>Liquidity:</b> $${formatNumber(additionalInfo.liquidity)}`;
+            }
+            if (additionalInfo.fdv) {
+                message += `\n📊 <b>FDV:</b> $${formatNumber(additionalInfo.fdv)}`;
+            }
+            if (additionalInfo.pairAge) {
+                message += `\n⏰ <b>Age:</b> ${additionalInfo.pairAge.toFixed(1)} hours`;
+            }
+            if (additionalInfo.dexId) {
+                message += `\n🏪 <b>DEX:</b> ${additionalInfo.dexId}`;
+            }
+        }
+
+        if (burnStatus.totalBurned) {
+            message += `\n🔥 <b>Burned Amount:</b> ${formatNumber(burnStatus.totalBurned)}`;
+        }
+
+        message += `
 
 🔗 <b>Links:</b>
 • <a href="https://solscan.io/token/${account}">Solscan</a>
@@ -733,14 +741,31 @@ bot.onText(/\/debug/, async (msg) => {
 
     // Manual check futtatása
     try {
-        const testPools = await getNewPoolsFromDEX();
-        await bot.sendMessage(chatId, `Found ${testPools.length} DEX pools to check`, { parse_mode: 'HTML' });
+        // DexScreener check
+        const dexTokens = await getLatestMemeTokens();
+        await bot.sendMessage(chatId, `Found ${dexTokens.length} tokens from DexScreener`, { parse_mode: 'HTML' });
         
-        // Első pool ellenőrzése
-        if (testPools.length > 0) {
-            const firstPool = testPools[0];
-            await bot.sendMessage(chatId, `Checking pool: <code>${firstPool}</code>`, { parse_mode: 'HTML' });
+        // Első token részletes ellenőrzése
+        if (dexTokens.length > 0) {
+            const firstToken = dexTokens[0];
+            await bot.sendMessage(chatId, `
+<b>First token:</b>
+• Name: ${firstToken.name}
+• Symbol: ${firstToken.symbol}
+• Address: <code>${firstToken.address}</code>
+• Liquidity: $${formatNumber(firstToken.liquidity)}
+• Age: ${firstToken.pairAge.toFixed(1)}h
+
+Checking LP burn status...`, { parse_mode: 'HTML' });
+            
+            const burnStatus = await checkRugCheckAPI(firstToken.address);
+            await bot.sendMessage(chatId, `LP Burn: ${burnStatus.burned ? '✅ YES' : '❌ NO'} (${burnStatus.percentage}%)`, { parse_mode: 'HTML' });
         }
+        
+        // DEX pools check
+        const testPools = await getNewPoolsFromDEX();
+        await bot.sendMessage(chatId, `Found ${testPools.length} DEX pools`, { parse_mode: 'HTML' });
+        
     } catch (error) {
         await bot.sendMessage(chatId, `❌ Debug error: ${error.message}`, { parse_mode: 'HTML' });
     }
@@ -777,6 +802,40 @@ bot.onText(/\/clear/, async (msg) => {
     
     await bot.sendMessage(chatId, '✅ Cache cleared successfully', { parse_mode: 'HTML' });
     log('info', 'Cache manually cleared', { by: userId });
+});
+
+bot.onText(/\/testscan/, async (msg) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+
+    if (!isAdmin(userId)) {
+        return bot.sendMessage(chatId, `❌ Unauthorized. Your ID: ${userId}`);
+    }
+
+    await bot.sendMessage(chatId, '🔄 Running test scan for LP burns...', { parse_mode: 'HTML' });
+    
+    try {
+        // Ismert LP burn token példa tesztelésre
+        const testTokens = [
+            'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', // Bonk
+            '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr', // POPCAT
+        ];
+        
+        for (const token of testTokens) {
+            const burnStatus = await checkLPBurnViaExplorer(token);
+            await bot.sendMessage(chatId, `
+Token: <code>${token}</code>
+Burn Status: ${burnStatus.burned ? '✅' : '❌'}
+Percentage: ${burnStatus.percentage}%
+Source: ${burnStatus.source || 'Chain'}`, { parse_mode: 'HTML' });
+        }
+        
+        // Valódi scan
+        await periodicCheck();
+        await bot.sendMessage(chatId, '✅ Test scan completed', { parse_mode: 'HTML' });
+    } catch (error) {
+        await bot.sendMessage(chatId, `❌ Error: ${error.message}`, { parse_mode: 'HTML' });
+    }
 });
 
 // ========================= WEBHOOK HANDLER =========================
@@ -831,6 +890,121 @@ app.get('/health', (req, res) => {
         processed: processedTokens.size
     });
 });
+
+async function getLatestMemeTokens() {
+    try {
+        log('info', 'Fetching latest meme tokens from DexScreener');
+        
+        // DexScreener API - ingyenes, nem kell kulcs
+        const response = await axios.get(
+            'https://api.dexscreener.com/latest/dex/tokens/solana',
+            {
+                timeout: 10000,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0',
+                    'Accept': 'application/json'
+                }
+            }
+        );
+
+        if (!response.data || !response.data.pairs) {
+            log('warn', 'No data from DexScreener');
+            return [];
+        }
+
+        const pairs = response.data.pairs;
+        const newTokens = [];
+        
+        // Csak az új, kis market cap tokeneket nézzük
+        for (const pair of pairs) {
+            if (pair.chainId !== 'solana') continue;
+            
+            const tokenAddress = pair.baseToken?.address;
+            const tokenName = pair.baseToken?.name;
+            const tokenSymbol = pair.baseToken?.symbol;
+            const liquidity = pair.liquidity?.usd || 0;
+            const fdv = pair.fdv || 0;
+            const pairAge = pair.pairCreatedAt ? (Date.now() - pair.pairCreatedAt) / 3600000 : 999; // órákban
+            
+            // Szűrési feltételek
+            if (tokenAddress && 
+                tokenName && 
+                tokenSymbol &&
+                !processedTokens.has(tokenAddress) &&
+                pairAge < 24 && // 24 óránál fiatalabb
+                liquidity < 100000 && // 100k USD alatt
+                fdv < 1000000) { // 1M FDV alatt
+                
+                newTokens.push({
+                    address: tokenAddress,
+                    name: tokenName,
+                    symbol: tokenSymbol,
+                    liquidity: liquidity,
+                    fdv: fdv,
+                    pairAge: pairAge,
+                    dexId: pair.dexId,
+                    pairAddress: pair.pairAddress
+                });
+                
+                if (newTokens.length >= 10) break;
+            }
+        }
+        
+        log('info', `Found ${newTokens.length} new meme tokens from DexScreener`);
+        return newTokens;
+    } catch (error) {
+        log('error', 'Failed to get tokens from DexScreener', { error: error.message });
+        return [];
+    }
+}
+
+async function checkRugCheckAPI(tokenAddress) {
+    try {
+        // RugCheck API - ingyenes
+        const response = await axios.get(
+            `https://api.rugcheck.xyz/v1/tokens/${tokenAddress}/report`,
+            {
+                timeout: 10000,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0',
+                    'Accept': 'application/json'
+                }
+            }
+        );
+
+        if (response.data) {
+            const report = response.data;
+            
+            // Ellenőrizzük az LP burn státuszt
+            if (report.risks) {
+                for (const risk of report.risks) {
+                    if (risk.name === 'LP_BURNED' && risk.value === 100) {
+                        return {
+                            burned: true,
+                            percentage: 100,
+                            source: 'RugCheck'
+                        };
+                    }
+                }
+            }
+            
+            // Vagy ha van LP lock info
+            if (report.lpLocked && report.lpLockedPct >= 99) {
+                return {
+                    burned: false,
+                    percentage: 0,
+                    locked: true,
+                    lockedPercentage: report.lpLockedPct
+                };
+            }
+        }
+        
+        return { burned: false, percentage: 0 };
+    } catch (error) {
+        log('debug', 'RugCheck API not available', { tokenAddress });
+        return { burned: false, percentage: 0 };
+    }
+}
 
 async function getNewPoolsFromDEX() {
     try {
@@ -980,63 +1154,80 @@ async function periodicCheck() {
     try {
         log('info', 'Starting periodic check');
         
-        // Három módszer kombinálása
-        const [chainTokens, dexPools, jupiterTokens] = await Promise.all([
+        // DexScreener-ről új tokenek lekérése (legmegbízhatóbb)
+        const dexScreenerTokens = await getLatestMemeTokens();
+        
+        if (dexScreenerTokens.length > 0) {
+            log('info', `Checking ${dexScreenerTokens.length} tokens for LP burn`);
+            
+            for (const token of dexScreenerTokens) {
+                // Először RugCheck API
+                let burnStatus = await checkRugCheckAPI(token.address);
+                
+                // Ha nem találtunk infót, próbáljuk a többi módszert
+                if (!burnStatus.burned) {
+                    burnStatus = await checkLPBurnViaExplorer(token.address);
+                }
+                
+                if (burnStatus.burned) {
+                    log('info', `LP BURN FOUND: ${token.name} (${token.symbol})`);
+                    
+                    // Token alert küldése
+                    await sendTokenAlert({
+                        account: token.address,
+                        onChainMetadata: {
+                            metadata: {
+                                data: {
+                                    name: token.name,
+                                    symbol: token.symbol,
+                                    decimals: 9
+                                }
+                            }
+                        },
+                        burnStatus,
+                        additionalInfo: {
+                            liquidity: token.liquidity,
+                            fdv: token.fdv,
+                            pairAge: token.pairAge,
+                            dexId: token.dexId
+                        }
+                    });
+                    
+                    processedTokens.add(token.address);
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                }
+            }
+        }
+        
+        // Alternatív források (backup)
+        const [chainTokens, jupiterTokens] = await Promise.all([
             getNewTokensAlternative(),
-            getNewPoolsFromDEX(),
             getNewTokensFromJupiter()
         ]);
-
-        // Jupiter tokenek feldolgozása (ezek a legmegbízhatóbbak)
+        
+        // Chain tokenek feldolgozása
+        if (chainTokens.length > 0) {
+            log('info', `Found ${chainTokens.length} LP burn tokens from chain`);
+            for (const token of chainTokens) {
+                await sendTokenAlert(token);
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            }
+        }
+        
+        // Jupiter tokenek feldolgozása
         if (jupiterTokens.length > 0) {
-            log('info', `Found ${jupiterTokens.length} new LP burn tokens from Jupiter`);
-            
+            log('info', `Found ${jupiterTokens.length} LP burn tokens from Jupiter`);
             for (const token of jupiterTokens) {
                 await sendTokenAlert(token);
                 await new Promise(resolve => setTimeout(resolve, 2000));
             }
         }
 
-        // DEX pool-ok ellenőrzése
-        for (const poolAddress of dexPools) {
-            try {
-                const metadata = await getTokenMetadata(poolAddress);
-                if (metadata && metadata.onChainMetadata?.metadata?.data?.name) {
-                    const burnStatus = await checkLPBurnViaExplorer(poolAddress);
-                    
-                    if (burnStatus.burned && !processedTokens.has(poolAddress)) {
-                        await sendTokenAlert({
-                            account: poolAddress,
-                            ...metadata,
-                            burnStatus
-                        });
-                        processedTokens.add(poolAddress);
-                        await new Promise(resolve => setTimeout(resolve, 2000));
-                    }
-                }
-            } catch (error) {
-                log('debug', 'Failed to check pool', {
-                    pool: poolAddress,
-                    error: error.message
-                });
-            }
+        if (dexScreenerTokens.length === 0 && chainTokens.length === 0 && jupiterTokens.length === 0) {
+            log('info', 'No new LP burn tokens found in this check');
         }
 
-        // Chain token-ek feldolgozása
-        if (chainTokens.length > 0) {
-            log('info', `Found ${chainTokens.length} new LP burn tokens from chain`);
-            
-            for (const token of chainTokens) {
-                await sendTokenAlert(token);
-                await new Promise(resolve => setTimeout(resolve, 2000));
-            }
-        }
-
-        if (chainTokens.length === 0 && dexPools.length === 0 && jupiterTokens.length === 0) {
-            log('info', 'No new LP burn tokens found');
-        }
-
-        // Cache tisztítás ha túl nagy
+        // Cache tisztítás
         if (processedTokens.size > 10000) {
             const toKeep = Array.from(processedTokens).slice(-5000);
             processedTokens.clear();
