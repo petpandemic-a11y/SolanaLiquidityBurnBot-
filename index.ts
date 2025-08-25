@@ -14,7 +14,6 @@ const connection = new Connection(RPC_ENDPOINT, { commitment: "confirmed" });
 // --- Token név lekérdezése on-chain metadata alapján ---
 async function getTokenName(mint: string): Promise<string | null> {
   try {
-    // Metaplex Metadata PDA kiszámítása
     const metadataProgramId = new PublicKey(
       "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s" // Metaplex Metadata Program
     );
@@ -28,9 +27,11 @@ async function getTokenName(mint: string): Promise<string | null> {
     );
 
     const accountInfo = await connection.getAccountInfo(metadataPDA);
-    if (!accountInfo) return null;
+    if (!accountInfo) {
+      console.log(`[INFO] Nincs metadata account a minthez: ${mint}`);
+      return null;
+    }
 
-    // Metadata parsing (egyszerű string keresés)
     const data = accountInfo.data.toString();
     const match = data.match(/[\x20-\x7E]{3,}/g); // olvasható stringek
     if (!match) return null;
@@ -38,7 +39,7 @@ async function getTokenName(mint: string): Promise<string | null> {
     const possibleName = match.find((s) => s.length < 30);
     return possibleName || null;
   } catch (e) {
-    console.error("getTokenName error:", e);
+    console.error(`[ERROR] getTokenName hiba mint=${mint}:`, e);
     return null;
   }
 }
@@ -58,33 +59,50 @@ async function sendTelegramMessage(text: string) {
         }),
       }
     );
+    console.log(`[TG] Üzenet elküldve: ${text}`);
   } catch (e) {
-    console.error("Telegram error:", e);
+    console.error("[ERROR] Telegram hiba:", e);
   }
 }
 
 // --- Burn figyelés ---
 async function startBurnListener() {
+  console.log(`[INIT] LP Burn figyelés indul RPC-n: ${RPC_ENDPOINT}`);
+
   connection.onLogs("all", async (log) => {
     try {
       if (!log.logs.some((l) => l.includes("Instruction: Burn"))) return;
 
-      // Mint cím kinyerése a logból
+      console.log("---------------------------------------------------");
+      console.log(`[BURN] Burn esemény tx=${log.signature}`);
+
+      // Mint cím kinyerése a logból (egyszerű keresés)
       const mintMatch = log.logs.find((l) => l.includes("mint:"));
-      if (!mintMatch) return;
+      if (!mintMatch) {
+        console.log("[WARN] Nem találtam mint címet a logban");
+        return;
+      }
 
       const mint = mintMatch.split(" ").pop()?.trim();
-      if (!mint) return;
+      if (!mint) {
+        console.log("[WARN] Mint cím parsing sikertelen");
+        return;
+      }
+
+      console.log(`[INFO] Burn mint=${mint}`);
 
       const tokenName = await getTokenName(mint);
+      console.log(`[INFO] Token név=${tokenName || "ismeretlen"}`);
 
       if (tokenName && tokenName.toUpperCase().includes("LP")) {
-        const msg = `🔥 LP Burn detected!\nToken: ${tokenName}\nMint: ${mint}`;
-        console.log(msg);
+        const msg = `🔥 <b>LP Burn detected!</b>\n\nToken: ${tokenName}\nMint: <code>${mint}</code>\nTx: https://solscan.io/tx/${log.signature}`;
+        console.log("[MATCH] LP Burn megfelelt → küldés Telegramra");
         await sendTelegramMessage(msg);
+      } else {
+        console.log("[SKIP] Nem LP token, kihagyva");
       }
     } catch (e) {
-      console.error("Burn listener error:", e);
+      console.error("[ERROR] Burn listener hiba:", e);
     }
   });
 }
