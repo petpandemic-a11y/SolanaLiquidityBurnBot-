@@ -10,7 +10,12 @@ const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'secure_webhook_secret';
 const PORT = process.env.PORT || 3000;
-const ADMIN_IDS = (process.env.ADMIN_IDS || '').split(',').map(id => id.trim()).filter(Boolean);
+
+// Admin IDs beállítása - debug logolással
+const adminIdsEnv = process.env.ADMIN_IDS || '';
+console.log('ADMIN_IDS environment variable:', adminIdsEnv);
+const ADMIN_IDS = adminIdsEnv ? adminIdsEnv.split(',').map(id => id.trim()).filter(Boolean) : [];
+console.log('Parsed ADMIN_IDS:', ADMIN_IDS);
 
 // Solana kapcsolat
 const SOLANA_RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
@@ -263,47 +268,83 @@ async function checkLPBurnViaExplorer(tokenAddress) {
 
 async function checkLPBurnOnChain(tokenAddress) {
     try {
-        const mintPubkey = new PublicKey(tokenAddress);
-        const largestAccounts = await connection.getTokenLargestAccounts(mintPubkey);
-        
-        if (!largestAccounts.value || largestAccounts.value.length === 0) {
-            return { burned: false, percentage: 0 };
+        // Speciális esetek kezelése (SOL és USDC nagy tokenek)
+        const specialTokens = [
+            'So11111111111111111111111111111111111111112', // Wrapped SOL
+            'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+            'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+            'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So', // mSOL
+            '7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj' // stSOL
+        ];
+
+        // Ha ez egy nagy token, nem lehet LP burn
+        if (specialTokens.includes(tokenAddress)) {
+            return { burned: false, percentage: 0, reason: 'Major token' };
         }
 
-        const supply = await connection.getTokenSupply(mintPubkey);
-        const totalSupply = supply.value.uiAmount || 0;
+        const mintPubkey = new PublicKey(tokenAddress);
+        
+        // Először próbáljuk meg a supply-t lekérni
+        let totalSupply;
+        try {
+            const supply = await connection.getTokenSupply(mintPubkey);
+            totalSupply = supply.value.uiAmount || 0;
+        } catch (supplyError) {
+            log('debug', 'Cannot get token supply', { tokenAddress });
+            return { burned: false, percentage: 0 };
+        }
 
         if (totalSupply === 0) {
             return { burned: false, percentage: 0 };
         }
 
-        // Burn címek
-        const burnAddresses = [
-            '1111111111111111111111111111111111111111111',
-            'burnSoLBurnSoLBurnSoLBurnSoLBurnSoLBurnSoL',
-            'DeadSoLBurnSoLBurnSoLBurnSoLBurnSoLBurnSoL'
-        ];
+        // Legnagyobb account lekérése - óvatosan
+        try {
+            const largestAccounts = await connection.getTokenLargestAccounts(mintPubkey);
+            
+            if (!largestAccounts.value || largestAccounts.value.length === 0) {
+                return { burned: false, percentage: 0 };
+            }
 
-        let burnedAmount = 0;
+            // Burn címek
+            const burnAddresses = [
+                '1111111111111111111111111111111111111111111',
+                'burnSoLBurnSoLBurnSoLBurnSoLBurnSoLBurnSoL',
+                'DeadSoLBurnSoLBurnSoLBurnSoLBurnSoLBurnSoL'
+            ];
 
-        for (const account of largestAccounts.value) {
-            const accountInfo = await connection.getAccountInfo(account.address);
-            if (accountInfo) {
-                const owner = accountInfo.owner.toBase58();
-                if (burnAddresses.some(burn => owner.includes(burn))) {
-                    burnedAmount += account.uiAmount || 0;
+            let burnedAmount = 0;
+
+            // Csak az első 3 legnagyobb accountot nézzük
+            for (const account of largestAccounts.value.slice(0, 3)) {
+                try {
+                    const accountInfo = await connection.getAccountInfo(account.address);
+                    if (accountInfo) {
+                        const owner = accountInfo.owner.toBase58();
+                        if (burnAddresses.some(burn => owner.includes(burn))) {
+                            burnedAmount += account.uiAmount || 0;
+                        }
+                    }
+                } catch (accountError) {
+                    log('debug', 'Cannot check account', { address: account.address.toString() });
                 }
             }
+
+            const burnPercentage = (burnedAmount / totalSupply) * 100;
+
+            return {
+                burned: burnPercentage >= 99.9,
+                percentage: burnPercentage,
+                totalBurned: burnedAmount,
+                totalSupply: totalSupply
+            };
+        } catch (error) {
+            log('debug', 'Cannot get largest accounts', { 
+                tokenAddress,
+                error: error.message 
+            });
+            return { burned: false, percentage: 0 };
         }
-
-        const burnPercentage = (burnedAmount / totalSupply) * 100;
-
-        return {
-            burned: burnPercentage >= 99.9,
-            percentage: burnPercentage,
-            totalBurned: burnedAmount,
-            totalSupply: totalSupply
-        };
     } catch (error) {
         log('error', 'Failed to check LP burn on chain', { 
             tokenAddress, 
@@ -480,6 +521,47 @@ bot.onText(/\/myid/, async (msg) => {
     const userId = msg.from.id;
     
     await bot.sendMessage(chatId, `Your User ID: <code>${userId}</code>`, { parse_mode: 'HTML' });
+});
+
+bot.onText(/\/setadmin (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    
+    // Ez egy emergency admin beállítás - csak az első indításkor használható
+    if (ADMIN_IDS.length === 0 && match[1] === String(userId)) {
+        ADMIN_IDS.push(String(userId));
+        await bot.sendMessage(chatId, `✅ Emergency admin set for user ID: ${userId}\n\n⚠️ Please set ADMIN_IDS environment variable on Render.com!`, { parse_mode: 'HTML' });
+        log('warning', 'Emergency admin set', { userId });
+    } else {
+        await bot.sendMessage(chatId, '❌ Cannot set admin this way. Please configure ADMIN_IDS environment variable.');
+    }
+});
+
+bot.onText(/\/envcheck/, async (msg) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    
+    const envInfo = `
+🔍 <b>Environment Check</b>
+
+<b>Your User ID:</b> <code>${userId}</code>
+
+<b>Environment Variables Status:</b>
+• BOT_TOKEN: ${BOT_TOKEN ? '✅ Set' : '❌ Missing'}
+• HELIUS_API_KEY: ${HELIUS_API_KEY ? '✅ Set' : '❌ Missing'}
+• CHANNEL_ID: ${CHANNEL_ID ? '✅ Set' : '❌ Missing'}
+• ADMIN_IDS raw: "${process.env.ADMIN_IDS || 'NOT SET'}"
+• ADMIN_IDS parsed: [${ADMIN_IDS.join(', ')}]
+• PORT: ${PORT}
+
+<b>Admin Check:</b>
+• Your ID in admin list: ${ADMIN_IDS.includes(String(userId)) ? '✅ Yes' : '❌ No'}
+• Admin list length: ${ADMIN_IDS.length}
+
+${ADMIN_IDS.length === 0 ? '\n⚠️ <b>No admins configured!</b>\nUse /setadmin ' + userId + ' to set yourself as emergency admin' : ''}
+`;
+
+    await bot.sendMessage(chatId, envInfo, { parse_mode: 'HTML' });
 });
 
 bot.onText(/\/test/, async (msg) => {
@@ -822,24 +904,42 @@ async function getNewTokensFromJupiter() {
         const tokens = response.data;
         const newTokensToCheck = [];
 
-        // Csak az új tokeneket nézzük (amelyek még nincsenek a cache-ben)
-        for (const token of tokens.slice(0, 50)) { // Maximum 50 token ellenőrzése
-            if (!processedTokens.has(token.address) && token.name && token.symbol) {
+        // Szűrjük ki a nagy/ismert tokeneket
+        const excludeTokens = [
+            'So11111111111111111111111111111111111111112', // Wrapped SOL
+            'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+            'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+            'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So', // mSOL
+            '7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj' // stSOL
+        ];
+
+        // Csak az új és kis tokeneket nézzük
+        for (const token of tokens) {
+            if (!processedTokens.has(token.address) && 
+                !excludeTokens.includes(token.address) &&
+                token.name && 
+                token.symbol &&
+                token.tags && 
+                token.tags.includes('community')) { // Csak community tokenek
+                
                 newTokensToCheck.push({
                     address: token.address,
                     name: token.name,
                     symbol: token.symbol,
                     decimals: token.decimals
                 });
+                
+                // Maximum 20 tokent vizsgálunk
+                if (newTokensToCheck.length >= 20) break;
             }
         }
 
-        log('info', `Found ${newTokensToCheck.length} new tokens from Jupiter to check`);
+        log('info', `Found ${newTokensToCheck.length} new community tokens from Jupiter to check`);
 
         const burnedTokens = [];
         
         // LP burn ellenőrzés
-        for (const token of newTokensToCheck.slice(0, 10)) { // Maximum 10 token részletes ellenőrzése
+        for (const token of newTokensToCheck.slice(0, 5)) { // Maximum 5 token részletes ellenőrzése
             const burnStatus = await checkLPBurnViaExplorer(token.address);
             
             if (burnStatus.burned) {
@@ -860,7 +960,7 @@ async function getNewTokensFromJupiter() {
             }
             
             // Kis késleltetés a rate limit miatt
-            await new Promise(resolve => setTimeout(resolve, 500));
+            await new Promise(resolve => setTimeout(resolve, 1000));
         }
 
         return burnedTokens;
