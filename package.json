@@ -1,20 +1,32 @@
 {
-  "name": "solana-liquidity-burn-bot",
+  "name": "solana-memecoin-telegram-bot",
   "version": "1.0.0",
-  "description": "Raydium LP burn monitor bot",
-  "main": "index.js",
-  "type": "module",
+  "description": "Solana memecoin audit Telegram bot automatikus csatorna posztolással",
+  "main": "bot.js",
   "scripts": {
-    "start": "node test.js && node index.js"
+    "start": "node bot.js",
+    "dev": "nodemon bot.js",
+    "test": "node test.js"
   },
   "dependencies": {
-    "axios": "^1.6.7",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "ws": "^8.15.1",
-    "node-fetch": "^3.3.2"
+    "node-telegram-bot-api": "^0.64.0",
+    "@solana/web3.js": "^1.87.6",
+    "@solana/spl-token": "^0.3.9",
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1"
   },
-  "engines": {
-    "node": ">=18"
-  }
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "keywords": [
+    "solana",
+    "memecoin",
+    "telegram",
+    "bot",
+    "audit",
+    "lp-burn",
+    "defi"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
 }
