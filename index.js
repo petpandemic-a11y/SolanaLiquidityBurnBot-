@@ -1,6 +1,8 @@
 // Solana Memecoin Audit Telegram Bot
 // Átírva a Solana-MemeToken-Audit-Result alapján
 
+require('dotenv').config();
+
 const TelegramBot = require('node-telegram-bot-api');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const { getMint, getAccount } = require('@solana/spl-token');
