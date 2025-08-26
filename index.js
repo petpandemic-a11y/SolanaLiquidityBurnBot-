@@ -401,7 +401,7 @@ process.on('SIGINT', () => {
   process.exit(0);
 });
 
-// Dummy HTTP szerver Render.com-hoz
+// HTTP szerver hozzáadása Render.com Web Service-hez
 const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -409,27 +409,76 @@ const PORT = process.env.PORT || 3000;
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({ 
-    status: 'online',
+    status: '🟢 Online',
     bot: 'Solana Token Auditor Bot',
     channel: CHANNEL_ID,
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: `${Math.floor(process.uptime())} seconds`,
+    memoryUsage: process.memoryUsage(),
+    nodeVersion: process.version
   });
 });
 
-// Bot status endpoint
+// Bot status endpoint  
 app.get('/status', (req, res) => {
   res.json({
     monitoredTokens: monitoredTokens.size,
     processedTokens: processedTokens.size,
-    activeMonitors: Array.from(monitoredTokens.keys())
+    activeMonitors: Array.from(monitoredTokens.keys()),
+    botStatus: bot.isPolling() ? 'Polling' : 'Stopped'
   });
 });
 
+// Manual audit endpoint (webhook style)
+app.post('/audit', express.json(), async (req, res) => {
+  const { tokenAddress } = req.body;
+  
+  if (!tokenAddress) {
+    return res.status(400).json({ error: 'Token address required' });
+  }
+  
+  try {
+    const auditResult = await auditor.auditToken(tokenAddress);
+    const message = formatAuditMessage(auditResult);
+    
+    await bot.sendMessage(CHANNEL_ID, message, { parse_mode: 'Markdown' });
+    
+    res.json({ 
+      success: true, 
+      message: 'Audit posted to channel',
+      tokenAddress 
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      error: error.message,
+      tokenAddress 
+    });
+  }
+});
+
+// Webhook endpoint for external triggers
+app.post('/webhook/new-token', express.json(), async (req, res) => {
+  const { tokenAddress, source } = req.body;
+  
+  console.log(`🔔 Webhook trigger: ${tokenAddress} from ${source}`);
+  
+  try {
+    const auditResult = await auditor.auditToken(tokenAddress);
+    const message = `🔔 **NEW TOKEN DETECTED**\nSource: ${source}\n\n${formatAuditMessage(auditResult)}`;
+    
+    await bot.sendMessage(CHANNEL_ID, message, { parse_mode: 'Markdown' });
+    
+    res.json({ success: true, source, tokenAddress });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Start HTTP server
-app.listen(PORT, () => {
-  console.log(`🌐 HTTP szerver fut a porton: ${PORT}`);
-  console.log(`📊 Status: http://localhost:${PORT}/status`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🌐 HTTP szerver fut: http://0.0.0.0:${PORT}`);
+  console.log(`📊 Health check: http://0.0.0.0:${PORT}/`);
+  console.log(`📈 Status: http://0.0.0.0:${PORT}/status`);
 });
 
 console.log('🤖 Solana Token Auditor Bot elindult!');
