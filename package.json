@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Monitor Raydium meme token LP burns",
   "main": "index.js",
-  "type": "module",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
@@ -11,5 +11,8 @@
     "@solana/web3.js": "^1.95.3",
     "dotenv": "^16.4.5",
     "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
