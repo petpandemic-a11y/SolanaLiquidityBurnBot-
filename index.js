@@ -8,10 +8,33 @@ const { Connection, PublicKey } = require('@solana/web3.js');
 const { getMint, getAccount } = require('@solana/spl-token');
 const axios = require('axios');
 
+// Environment variables ellenőrzés
+console.log('🔍 Environment variables ellenőrzése...');
+console.log('BOT_TOKEN:', process.env.TELEGRAM_BOT_TOKEN ? '✅ Beállítva' : '❌ Hiányzik');
+console.log('CHANNEL_ID:', process.env.TELEGRAM_CHANNEL_ID ? '✅ Beállítva' : '❌ Hiányzik');
+console.log('HELIUS_API_KEY:', process.env.HELIUS_API_KEY ? '✅ Beállítva' : '❌ Hiányzik');
+
 // Konfigurációs változók - .env fájlból töltődnek
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID; // pl: @your_channel vagy -1001234567890
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+
+// Ellenőrzés, hogy minden szükséges változó be van-e állítva
+if (!BOT_TOKEN) {
+  console.error('❌ TELEGRAM_BOT_TOKEN nincs beállítva a .env fájlban!');
+  process.exit(1);
+}
+
+if (!CHANNEL_ID) {
+  console.error('❌ TELEGRAM_CHANNEL_ID nincs beállítva a .env fájlban!');
+  process.exit(1);
+}
+
+if (!HELIUS_API_KEY) {
+  console.error('❌ HELIUS_API_KEY nincs beállítva a .env fájlban!');
+  process.exit(1);
+}
+
 const RPC_ENDPOINT = `https://rpc.helius.xyz/?api-key=${HELIUS_API_KEY}`;
 
 // Bot és Solana connection inicializálása
@@ -378,7 +401,38 @@ process.on('SIGINT', () => {
   process.exit(0);
 });
 
+// Dummy HTTP szerver Render.com-hoz
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'online',
+    bot: 'Solana Token Auditor Bot',
+    channel: CHANNEL_ID,
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
+
+// Bot status endpoint
+app.get('/status', (req, res) => {
+  res.json({
+    monitoredTokens: monitoredTokens.size,
+    processedTokens: processedTokens.size,
+    activeMonitors: Array.from(monitoredTokens.keys())
+  });
+});
+
+// Start HTTP server
+app.listen(PORT, () => {
+  console.log(`🌐 HTTP szerver fut a porton: ${PORT}`);
+  console.log(`📊 Status: http://localhost:${PORT}/status`);
+});
+
 console.log('🤖 Solana Token Auditor Bot elindult!');
 console.log(`📢 Csatorna: ${CHANNEL_ID}`);
 
-module.exports = { auditor, bot };
+module.exports = { auditor, bot, app };
