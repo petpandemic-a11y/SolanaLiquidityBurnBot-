@@ -1,7 +1,3 @@
-Persze 👍 Akkor legyen egyetlen index.js fájl, sima Node.js környezetben futtatható, TypeScript nélkül.
-
-Íme a végleges verzió:
-
 // index.js
 import fs from 'fs';
 import { Connection, clusterApiUrl, PublicKey } from '@solana/web3.js';
@@ -34,7 +30,7 @@ function saveState() {
 // === Fetch new pools from Raydium API ===
 async function discoverNewPools() {
   try {
-    const url = `${RAYDIUM_API}/pools/info/list`; // returns all pools
+    const url = `${RAYDIUM_API}/pools/info/list`;
     const res = await fetch(url);
     const data = await res.json();
 
@@ -44,9 +40,16 @@ async function discoverNewPools() {
       const tokenA = pool.mintA?.symbol || '';
       const tokenB = pool.mintB?.symbol || '';
 
-      // MEME filter: crude check (can be improved)
+      // MEME + SOL szűrés
       if (tokenA.toLowerCase().includes('sol') || tokenB.toLowerCase().includes('sol')) {
-        if (tokenA.toLowerCase().includes('doge') || tokenA.toLowerCase().includes('pepe') || tokenA.toLowerCase().includes('inu') || tokenB.toLowerCase().includes('doge') || tokenB.toLowerCase().includes('pepe') || tokenB.toLowerCase().includes('inu')) {
+        if (
+          tokenA.toLowerCase().includes('doge') ||
+          tokenA.toLowerCase().includes('pepe') ||
+          tokenA.toLowerCase().includes('inu') ||
+          tokenB.toLowerCase().includes('doge') ||
+          tokenB.toLowerCase().includes('pepe') ||
+          tokenB.toLowerCase().includes('inu')
+        ) {
           if (!monitoredLPs[lpMint]) {
             console.log('✨ New MEME pool found:', tokenA, '/', tokenB, 'LP:', lpMint);
             monitorLP(lpMint);
@@ -69,15 +72,18 @@ async function monitorLP(lpMint) {
   console.log('👀 Monitoring LP:', lpMint);
 
   connection.onLogs(lpPubkey, (log) => {
-    if (log.logs.some(l => l.includes('burn'))) {
+    if (log.logs.some((l) => l.toLowerCase().includes('burn'))) {
       console.log('🔥 Burn detected for LP:', lpMint);
+    }
+    if (log.logs.some((l) => l.includes('11111111111111111111111111111111'))) {
+      console.log('🔒 LP sent to null address (lock) for:', lpMint);
     }
   }, 'confirmed');
 }
 
 // === CLI commands ===
 function handleCommand(cmd) {
-  const [command, arg] = cmd.trim().split(/\s+/);
+  const [command, arg] = cmd.trim().split(/\\s+/);
 
   switch (command) {
     case '/monitor':
@@ -102,37 +108,14 @@ function handleCommand(cmd) {
 (async () => {
   console.log('🚀 Raydium LP Burn Monitor started');
 
-  // reload existing
+  // Reload existing
   for (const lpMint of Object.keys(monitoredLPs)) {
     monitorLP(lpMint);
   }
 
-  // discovery loop
+  // Discovery loop
   setInterval(discoverNewPools, 60_000); // every 60s
 
-  // CLI
+  // CLI input
   process.stdin.on('data', (d) => handleCommand(d.toString()));
 })();
-
-Indítás
-
-1. npm init -y
-
-
-2. npm i @solana/web3.js node-fetch dotenv
-
-
-3. .env fájlban: RPC=https://api.mainnet-beta.solana.com (vagy saját RPC)
-
-
-4. node index.js
-
-
-
-
----
-
-👉 Ez már teljes értékű index.js, nem kell hozzá TS.
-
-Szeretnéd, hogy beleépítsem a null-címre transfer (LP lock) detektálást is a burn mellé?
-
