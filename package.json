@@ -2,10 +2,11 @@
   "name": "solana-memecoin-telegram-bot",
   "version": "1.0.0",
   "description": "Solana memecoin audit Telegram bot automatikus csatorna posztolással",
-  "main": "bot.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "nodemon bot.js",
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "build": "echo 'Build complete'",
     "test": "node test.js"
   },
   "dependencies": {
